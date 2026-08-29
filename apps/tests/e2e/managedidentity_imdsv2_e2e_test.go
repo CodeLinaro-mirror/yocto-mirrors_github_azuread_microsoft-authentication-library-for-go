@@ -320,13 +320,19 @@ func TestIMDSv2BoundTokenIsRejectedWithoutCertificate(t *testing.T) {
 	}
 
 	// The same token, presented over a connection with no client certificate.
-	_, status, err := getBoundSecret(ctx, fmt.Sprintf("https://%s/secrets/%s?api-version=7.4", vault, secret),
+	body, status, err := getBoundSecret(ctx, fmt.Sprintf("https://%s/secrets/%s?api-version=7.4", vault, secret),
 		res.AccessToken, tls.Certificate{})
 	if err != nil {
 		t.Fatalf("calling the vault: %v", err)
 	}
 	if status == http.StatusOK {
 		t.Fatal("the vault accepted a bound token presented without its binding certificate")
+	}
+	// Asserting only "not 200" would pass for any unrelated rejection, including an expired or
+	// malformed token, which would make this test green without proving anything about binding.
+	// The vault names the reason, so require that reason specifically.
+	if !strings.Contains(body, "MissingClientCertificate") {
+		t.Fatalf("the vault rejected the request for some reason other than the missing binding certificate: %d: %s", status, body)
 	}
 }
 
@@ -335,22 +341,30 @@ func TestIMDSv2BoundTokenIsRejectedWithoutCertificate(t *testing.T) {
 // A bound token is presented with the "mtls_pop" scheme rather than "Bearer", and the request
 // opts in to token binding with x-ms-tokenboundauth. Passing a zero tls.Certificate omits the
 // client certificate, which is how the negative case is expressed.
+//
+// The TLS settings below are the whole reason this test is interesting, and they are not optional.
+// Key Vault does not ask for a client certificate during the initial handshake; it completes the
+// handshake, reads the request, sees the mtls_pop scheme, and only then asks for the certificate by
+// renegotiating. Go refuses renegotiation by default (crypto/tls defaults to RenegotiateNever) and
+// has no support at all for the TLS 1.3 equivalent, post-handshake authentication, so a default
+// Go transport is torn down at exactly that point. The symptom is a bare connection reset with no
+// HTTP response to inspect, which looks like a network fault rather than a protocol gap. Pinning
+// TLS 1.2 keeps the exchange on the renegotiation path, and RenegotiateOnceAsClient lets Go answer
+// it. .NET and curl hit none of this because schannel renegotiates natively.
 func getBoundSecret(ctx context.Context, url, token string, cert tls.Certificate) (string, int, error) {
-	// Go only offers a client certificate when the server asks for one, and it matches
-	// tls.Config.Certificates against the certificate authorities the server says it accepts,
-	// silently sending nothing when none match. A binding certificate is issued by an internal CA
-	// the resource is not obliged to advertise, so it is selected through this callback, which is
-	// not filtered. Recording whether the callback ran distinguishes "the resource rejected our
-	// certificate" from "the resource never asked for one", which otherwise look identical: both
-	// end as a closed connection with no HTTP response to inspect.
-	var (
-		certRequested bool
-		acceptableCAs int
-	)
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	tlsConfig := &tls.Config{
+		MinVersion:    tls.VersionTLS12,
+		MaxVersion:    tls.VersionTLS12,
+		Renegotiation: tls.RenegotiateOnceAsClient,
+	}
+	// Go matches tls.Config.Certificates against the certificate authorities the server names and
+	// silently sends nothing when none match. A binding certificate is issued by an internal CA the
+	// resource is not obliged to advertise, so it is supplied through this callback instead, which
+	// is not filtered. Recording whether the callback ran distinguishes "the resource rejected our
+	// certificate" from "the resource never asked for one".
+	var certRequested bool
 	tlsConfig.GetClientCertificate = func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
 		certRequested = true
-		acceptableCAs = len(cri.AcceptableCAs)
 		if len(cert.Certificate) == 0 {
 			// Returning an empty certificate is how Go expresses "send none", which is the
 			// negative case rather than an error.
@@ -372,8 +386,8 @@ func getBoundSecret(ctx context.Context, url, token string, cert tls.Certificate
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", 0, fmt.Errorf("%w [the resource asked for a client certificate: %t; acceptable CAs it named: %d; a certificate was supplied to send: %t]",
-			err, certRequested, acceptableCAs, len(cert.Certificate) > 0)
+		return "", 0, fmt.Errorf("%w [the resource asked for a client certificate: %t; a certificate was supplied to send: %t]",
+			err, certRequested, len(cert.Certificate) > 0)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
