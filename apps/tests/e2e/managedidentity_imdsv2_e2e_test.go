@@ -48,8 +48,14 @@ import (
 	mi "github.com/AzureAD/microsoft-authentication-library-for-go/apps/managedidentity"
 )
 
+// A certificate-bound token can only be issued for a resource that has opted in to accepting one.
+// Entra refuses the request outright for a resource that has not, with AADSTS392196 ("the resource
+// application does not support certificate-bound token"), so the choice of resource is part of what
+// these tests exercise rather than an incidental detail. Microsoft Graph and Azure Key Vault both
+// accept bound tokens and are the two resources MSAL .NET uses for the same coverage. Azure Resource
+// Manager does not, so it cannot stand in here.
 const (
-	imdsV2ARMResource   = "https://management.azure.com"
+	imdsV2Resource      = "https://graph.microsoft.com"
 	imdsV2VaultResource = "https://vault.azure.net"
 )
 
@@ -93,7 +99,7 @@ func skipUnlessIMDSv2(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	_, err = client.AcquireToken(ctx, imdsV2ARMResource, mi.WithMtlsProofOfPossession())
+	_, err = client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession())
 	switch {
 	case err == nil:
 		return
@@ -122,7 +128,7 @@ func TestIMDSv2SystemAssignedBoundToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	res, err := client.AcquireToken(ctx, imdsV2ARMResource, mi.WithMtlsProofOfPossession())
+	res, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession())
 	if err != nil {
 		t.Fatalf("AcquireToken: %v", err)
 	}
@@ -168,7 +174,7 @@ func TestIMDSv2UserAssignedBoundToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	res, err := client.AcquireToken(ctx, imdsV2ARMResource, mi.WithMtlsProofOfPossession())
+	res, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession())
 	if err != nil {
 		t.Fatalf("AcquireToken: %v", err)
 	}
@@ -192,7 +198,7 @@ func TestIMDSv2BearerOverMtls(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	res, err := client.AcquireToken(ctx, imdsV2ARMResource, mi.WithRequestOverMtls())
+	res, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithRequestOverMtls())
 	if err != nil {
 		t.Fatalf("AcquireToken: %v", err)
 	}
@@ -221,11 +227,11 @@ func TestIMDSv2TokenIsServedFromCache(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	first, err := client.AcquireToken(ctx, imdsV2ARMResource, mi.WithMtlsProofOfPossession())
+	first, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession())
 	if err != nil {
 		t.Fatalf("first AcquireToken: %v", err)
 	}
-	second, err := client.AcquireToken(ctx, imdsV2ARMResource, mi.WithMtlsProofOfPossession())
+	second, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession())
 	if err != nil {
 		t.Fatalf("second AcquireToken: %v", err)
 	}
