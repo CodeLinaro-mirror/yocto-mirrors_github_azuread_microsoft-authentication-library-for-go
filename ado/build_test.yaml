@@ -192,6 +192,10 @@ stages:
                 go install gotest.tools/gotestsum
                 Pop-Location
                 $env:PATH = "$env:PATH;$(go env GOPATH)\bin"
+                # This agent is provisioned for managed identity, so an IMDSv2 environment skip is a
+                # regression rather than a legitimate gap. Without this the tests would skip and the
+                # stage would still report green, which looks identical to real coverage.
+                $env:IMDSV2_E2E_REQUIRED = "true"
                 gotestsum --junitfile "$(Build.SourcesDirectory)\mi-e2e-imds-tests.xml" -- -tags e2e -count=1 -run '^(TestManagedIdentityImds$|TestIMDSv2)' ./apps/tests/e2e/...
           - task: PublishTestResults@2
             displayName: "Publish MI E2E test results"

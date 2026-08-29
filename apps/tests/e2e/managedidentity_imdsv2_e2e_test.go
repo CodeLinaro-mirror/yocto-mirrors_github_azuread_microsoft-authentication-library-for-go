@@ -26,6 +26,10 @@
 //	IMDSV2_E2E_USER_ASSIGNED_CLIENT_ID  exercise a user-assigned identity as well as system-assigned
 //	IMDSV2_E2E_VAULT                    host of a Key Vault configured for token binding
 //	IMDSV2_E2E_SECRET                   name of a secret in that vault
+//	IMDSV2_E2E_REQUIRED                 set to "true" on an agent that is provisioned for IMDSv2, to
+//	                                    turn every environment skip below into a failure. Without it
+//	                                    a misconfigured agent reports the same green result as a
+//	                                    fully working one.
 package e2e
 
 import (
@@ -36,6 +40,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +53,27 @@ const (
 	imdsV2VaultResource = "https://vault.azure.net"
 )
 
+// imdsV2Required reports whether this environment is expected to complete the IMDSv2 flow.
+//
+// A skip and a pass look identical in a CI summary, so on an agent that is provisioned for managed
+// identity a skip is a silent regression rather than a legitimate environment gap. CI sets
+// IMDSV2_E2E_REQUIRED on that pool to turn every skip below into a failure. It stays unset on
+// developer machines, where skipping is the correct behavior.
+func imdsV2Required() bool {
+	required, err := strconv.ParseBool(os.Getenv("IMDSV2_E2E_REQUIRED"))
+	return err == nil && required
+}
+
+// skipOrFail skips when IMDSv2 is optional in this environment and fails when it is required.
+func skipOrFail(t *testing.T, format string, args ...interface{}) {
+	t.Helper()
+	if imdsV2Required() {
+		t.Fatalf("IMDSV2_E2E_REQUIRED is set, so this is a failure rather than an environment gap: "+
+			format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
 // skipUnlessIMDSv2 skips the test unless this host can actually complete the flow.
 //
 // The check is a real acquisition attempt rather than an environment probe, because the only
@@ -58,11 +84,11 @@ func skipUnlessIMDSv2(t *testing.T) {
 	t.Helper()
 	source, srcErr := mi.GetSource()
 	if srcErr != nil || source != mi.DefaultToIMDS {
-		t.Skipf("not an IMDS host (source=%v err=%v)", source, srcErr)
+		skipOrFail(t, "not an IMDS host (source=%v err=%v)", source, srcErr)
 	}
 	client, err := mi.New(mi.SystemAssigned())
 	if err != nil {
-		t.Skipf("cannot create a managed identity client: %v", err)
+		skipOrFail(t, "cannot create a managed identity client: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -72,13 +98,13 @@ func skipUnlessIMDSv2(t *testing.T) {
 	case err == nil:
 		return
 	case errors.Is(err, mi.ErrMtlsPoPNotSupportedInIMDSv1):
-		t.Skip("this host serves IMDSv1 only")
+		skipOrFail(t, "this host serves IMDSv1 only")
 	case errors.Is(err, mi.ErrCredentialGuardNotAvailable):
-		t.Skip("Credential Guard is not enabled on this host")
+		skipOrFail(t, "Credential Guard is not enabled on this host")
 	case errors.Is(err, mi.ErrMtlsNotSupportedForPlatform):
-		t.Skip("this platform cannot produce a KeyGuard key")
+		skipOrFail(t, "this platform cannot produce a KeyGuard key")
 	case strings.Contains(err.Error(), "identity_not_found"):
-		t.Skip("no managed identity is assigned to this host")
+		skipOrFail(t, "no managed identity is assigned to this host")
 	default:
 		t.Fatalf("IMDSv2 acquisition failed for a reason that is not an environment gap: %v", err)
 	}
@@ -131,7 +157,7 @@ func TestIMDSv2SystemAssignedBoundToken(t *testing.T) {
 func TestIMDSv2UserAssignedBoundToken(t *testing.T) {
 	clientID := os.Getenv("IMDSV2_E2E_USER_ASSIGNED_CLIENT_ID")
 	if clientID == "" {
-		t.Skip("IMDSV2_E2E_USER_ASSIGNED_CLIENT_ID is not set")
+		skipOrFail(t, "IMDSV2_E2E_USER_ASSIGNED_CLIENT_ID is not set")
 	}
 	skipUnlessIMDSv2(t)
 
@@ -221,7 +247,7 @@ func TestIMDSv2CallsBoundResource(t *testing.T) {
 	vault := os.Getenv("IMDSV2_E2E_VAULT")
 	secret := os.Getenv("IMDSV2_E2E_SECRET")
 	if vault == "" || secret == "" {
-		t.Skip("IMDSV2_E2E_VAULT and IMDSV2_E2E_SECRET are not set")
+		skipOrFail(t, "IMDSV2_E2E_VAULT and IMDSV2_E2E_SECRET are not set")
 	}
 	skipUnlessIMDSv2(t)
 
@@ -262,7 +288,7 @@ func TestIMDSv2BoundTokenIsRejectedWithoutCertificate(t *testing.T) {
 	vault := os.Getenv("IMDSV2_E2E_VAULT")
 	secret := os.Getenv("IMDSV2_E2E_SECRET")
 	if vault == "" || secret == "" {
-		t.Skip("IMDSV2_E2E_VAULT and IMDSV2_E2E_SECRET are not set")
+		skipOrFail(t, "IMDSV2_E2E_VAULT and IMDSV2_E2E_SECRET are not set")
 	}
 	skipUnlessIMDSv2(t)
 
