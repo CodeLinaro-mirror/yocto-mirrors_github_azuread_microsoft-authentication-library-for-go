@@ -4,11 +4,8 @@
 package managedidentity
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -239,54 +236,5 @@ func attestKeyGuard(endpoint, clientID string, key bindingKey) (string, error) {
 		return "", fmt.Errorf("managedidentity: KeyGuard attestation produced an empty token: %s",
 			strings.Join(drainAttestationLog(), "; "))
 	}
-	// TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
-	debugAttestation = describeAttestationToken(jwt)
 	return jwt, nil
-}
-
-// describeAttestationToken summarises a token without disclosing it.
-// TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
-func describeAttestationToken(jwt string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "len=%d segments=%d", len(jwt), len(strings.Split(jwt, ".")))
-	parts := strings.Split(jwt, ".")
-	for i, name := range []string{"header", "payload"} {
-		if i >= len(parts) {
-			break
-		}
-		raw, err := base64.RawURLEncoding.DecodeString(parts[i])
-		if err != nil {
-			fmt.Fprintf(&b, " %s=<undecodable: %v>", name, err)
-			continue
-		}
-		if name == "payload" {
-			// Report only the claim names and a few non-sensitive values; the
-			// claim set itself carries machine identity.
-			var claims map[string]json.RawMessage
-			if err := json.Unmarshal(raw, &claims); err != nil {
-				fmt.Fprintf(&b, " payload=<unparsable: %v>", err)
-				continue
-			}
-			names := make([]string, 0, len(claims))
-			for k := range claims {
-				names = append(names, k)
-			}
-			sort.Strings(names)
-			fmt.Fprintf(&b, " payloadClaims=%v", names)
-			for _, k := range []string{"iss", "x-ms-attestation-type", "x-ms-isolation-tee"} {
-				if v, ok := claims[k]; ok {
-					fmt.Fprintf(&b, " %s=%s", k, string(v))
-				}
-			}
-			continue
-		}
-		fmt.Fprintf(&b, " %s=%s", name, string(raw))
-	}
-	if logs := drainAttestationLog(); len(logs) > 0 {
-		if len(logs) > 12 {
-			logs = logs[len(logs)-12:]
-		}
-		fmt.Fprintf(&b, " nativeLog=[%s]", strings.Join(logs, " | "))
-	}
-	return b.String()
 }

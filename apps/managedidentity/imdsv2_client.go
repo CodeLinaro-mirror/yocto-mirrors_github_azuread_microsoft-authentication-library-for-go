@@ -47,15 +47,6 @@ type imdsV2 struct {
 	baseEndpoint string
 }
 
-// TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
-var debugMetadataBody []byte
-
-// TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
-var (
-	debugAttestation  string
-	debugResponseBody []byte
-)
-
 // endpoint builds an IMDS URL with the api version and any user-assigned
 // identity selector applied.
 func (v imdsV2) endpoint(path string) (string, error) {
@@ -101,7 +92,6 @@ func readIMDSResponse(resp *http.Response) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("managedidentity: reading the IMDS response: %w", err)
 	}
-	debugResponseBody = body // TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("managedidentity: IMDS returned %d: %s", resp.StatusCode, parseIMDSError(body))
 	}
@@ -142,7 +132,6 @@ func (v imdsV2) getCsrMetadata(ctx context.Context, correlationID string) (csrMe
 	if err != nil {
 		return csrMetadata{}, err
 	}
-	debugMetadataBody = body // TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
 
 	var metadata csrMetadata
 	if err := json.Unmarshal(body, &metadata); err != nil {
@@ -152,47 +141,6 @@ func (v imdsV2) getCsrMetadata(ctx context.Context, correlationID string) (csrMe
 		return csrMetadata{}, err
 	}
 	return metadata, nil
-}
-
-// TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
-//
-// The service rejects the attested request with a message too general to act
-// on, so this replays it with one variable changed at a time. The csr-only
-// control is the important one: it distinguishes "the CSR stopped being
-// acceptable" from "the attestation token is what is being rejected".
-func (v imdsV2) debugProbeVariants(ctx context.Context, correlationID, csr, attestationToken string) string {
-	target, err := v.endpoint(imdsV2IssueCredentialPath)
-	if err != nil {
-		return "probe: " + err.Error()
-	}
-	send := func(label, contentType string, body []byte) string {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(string(body)))
-		if err != nil {
-			return fmt.Sprintf("%s=<build failed: %v>", label, err)
-		}
-		setIMDSHeaders(req, correlationID)
-		req.Header.Set("Content-Type", contentType)
-		resp, err := v.httpClient.Do(req)
-		if err != nil {
-			return fmt.Sprintf("%s=<send failed: %v>", label, err)
-		}
-		defer resp.Body.Close()
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		if resp.StatusCode == http.StatusOK {
-			return fmt.Sprintf("%s=200_OK(len=%d)", label, len(raw))
-		}
-		return fmt.Sprintf("%s=%d:%s", label, resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-
-	csrOnly, _ := json.Marshal(certificateRequestBody{CSR: csr})
-	attested, _ := json.Marshal(certificateRequestBody{CSR: csr, AttestationToken: attestationToken})
-	camel, _ := json.Marshal(map[string]string{"csr": csr, "attestationToken": attestationToken})
-
-	return strings.Join([]string{
-		send("csrOnly", "application/json", csrOnly),
-		send("attestedUtf8", "application/json; charset=utf-8", attested),
-		send("camelCaseField", "application/json", camel),
-	}, " || ")
 }
 
 // issueCredential performs the second leg, exchanging a CSR for a certificate
@@ -227,14 +175,7 @@ func (v imdsV2) issueCredential(ctx context.Context, correlationID, csr, attesta
 	}
 	body, err := readIMDSResponse(resp)
 	if err != nil {
-		// TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
-		probe := ""
-		if attestationToken != "" {
-			probe = v.debugProbeVariants(ctx, correlationID, csr, attestationToken)
-		}
-		return certificateRequestResponse{}, fmt.Errorf(
-			"%w\n===IMDSV2-DIAG===\nMETADATA: %s\nRAWRESPONSE: %s\nPROBE: %s\nATTESTATION: %s\nCSR_B64: %s\n===END-DIAG===",
-			err, string(debugMetadataBody), string(debugResponseBody), probe, debugAttestation, csr)
+		return certificateRequestResponse{}, err
 	}
 	var issued certificateRequestResponse
 	if err := json.Unmarshal(body, &issued); err != nil {
