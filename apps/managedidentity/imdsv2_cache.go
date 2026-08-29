@@ -6,6 +6,7 @@ package managedidentity
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -179,7 +180,19 @@ func (v imdsV2) issueBindingCertificate(ctx context.Context, correlationID strin
 		return nil, err
 	}
 
-	issued, err := v.issueCredential(ctx, correlationID, csr)
+	// Attestation is attempted whenever the native library is deployed. When it
+	// is absent the request goes out non-attested and the service decides
+	// whether that is acceptable for this resource, which matches how MSAL .NET
+	// behaves without its optional attestation package. A library that is
+	// present but fails is a real error: silently downgrading would turn an MAA
+	// policy denial into a confusing rejection from IMDS instead.
+	attestationToken, err := attestKeyGuard(metadata.AttestationEndpoint, metadata.ClientID, key)
+	if err != nil && !errors.Is(err, errAttestationUnavailable) {
+		_ = key.Close()
+		return nil, err
+	}
+
+	issued, err := v.issueCredential(ctx, correlationID, csr, attestationToken)
 	if err != nil {
 		_ = key.Close()
 		return nil, err

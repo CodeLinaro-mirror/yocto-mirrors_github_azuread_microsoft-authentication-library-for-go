@@ -144,12 +144,12 @@ func (v imdsV2) getCsrMetadata(ctx context.Context, correlationID string) (csrMe
 
 // issueCredential performs the second leg, exchanging a CSR for a certificate
 // signed by IMDS.
-func (v imdsV2) issueCredential(ctx context.Context, correlationID, csr string) (certificateRequestResponse, error) {
+func (v imdsV2) issueCredential(ctx context.Context, correlationID, csr, attestationToken string) (certificateRequestResponse, error) {
 	target, err := v.endpoint(imdsV2IssueCredentialPath)
 	if err != nil {
 		return certificateRequestResponse{}, err
 	}
-	payload, err := json.Marshal(certificateRequestBody{CSR: csr})
+	payload, err := json.Marshal(certificateRequestBody{CSR: csr, AttestationToken: attestationToken})
 	if err != nil {
 		return certificateRequestResponse{}, fmt.Errorf("managedidentity: building the credential request: %w", err)
 	}

@@ -181,6 +181,35 @@ stages:
             inputs:
               version: $(goVersion)
           - task: PowerShell@2
+            displayName: "Fetch the KeyGuard attestation library"
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            inputs:
+              targetType: "inline"
+              script: |
+                $ErrorActionPreference = "Stop"
+                # AttestationClientLib.dll is a closed-source native component that
+                # cannot be redistributed in this repository, so it is restored at
+                # test time from the same internal feed MSAL .NET builds against.
+                # Its absence is not fatal to the library: the credential request
+                # simply goes out non-attested. It is fatal to this stage, because
+                # a resource that requires attestation would then fail for a reason
+                # unrelated to the code under test.
+                $pkg = "microsoft.azure.security.keyguardattestation"
+                $ver = "1.1.5"
+                $dir = "$(Agent.TempDirectory)\kgatt"
+                New-Item -ItemType Directory -Force -Path $dir | Out-Null
+                $nupkg = "$dir\$pkg.$ver.nupkg"
+                $url = "https://pkgs.dev.azure.com/IdentityDivision/_packaging/IDDP_PublicPackages/nuget/v3/flat2/$pkg/$ver/$pkg.$ver.nupkg"
+                Invoke-WebRequest -Headers @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" } -Uri $url -OutFile $nupkg
+                Expand-Archive -Path $nupkg -DestinationPath "$dir\extracted" -Force
+                $native = "$dir\extracted\runtimes\win-x64\native"
+                Get-ChildItem $native | ForEach-Object { Write-Host "  $($_.Name) $($_.Length) bytes" }
+                if (-not (Test-Path "$native\AttestationClientLib.dll")) {
+                  throw "AttestationClientLib.dll was not found in the package"
+                }
+                Write-Host "##vso[task.prependpath]$native"
+          - task: PowerShell@2
             displayName: "Run Managed Identity IMDS E2E Tests"
             inputs:
               targetType: "inline"
