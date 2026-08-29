@@ -28,7 +28,12 @@ import (
 // fixed name so the key survives process restarts: re-minting a key on every
 // start would mean a fresh certificate on every start, and IMDS rate limits
 // credential issuance.
-const bindingKeyName = "com.microsoft.msal-go.imdsv2-binding-key"
+//
+// The name carries the isolation contract. A key created by an earlier build
+// without per-boot isolation still opens and still reports itself as isolated,
+// so it would be inherited silently and produce an attestation statement the
+// service refuses. Changing the container is what retires those keys.
+const bindingKeyName = "com.microsoft.msal-go.imdsv2-binding-key.perboot"
 
 // imdsV2 carries everything the IMDSv2 legs need. It is split out from Client so
 // the IMDS calls can be exercised against a test server without constructing a

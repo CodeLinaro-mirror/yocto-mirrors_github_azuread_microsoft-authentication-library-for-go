@@ -67,8 +67,14 @@ const (
 	// ncryptUseVirtualIsolationFlag is NCRYPT_USE_VIRTUAL_ISOLATION_FLAG. It
 	// asks the KSP to place the private key inside the VBS trustlet.
 	ncryptUseVirtualIsolationFlag = 0x00020000
-	ncryptSilentFlag              = 0x00000040
-	ncryptOverwriteKeyFlag        = 0x00000080
+	// ncryptUsePerBootKeyFlag is NCRYPT_USE_PER_BOOT_KEY_FLAG. It ties the
+	// isolated key to the current boot, so it cannot survive a reboot and be
+	// replayed afterwards. The flag is reflected in the isolated key attributes
+	// that the attestation statement carries, and IMDS requires it, so a key
+	// created without it attests successfully but is refused a credential.
+	ncryptUsePerBootKeyFlag = 0x00040000
+	ncryptSilentFlag        = 0x00000040
+	ncryptOverwriteKeyFlag  = 0x00000080
 
 	// bcryptPadPSSFlag is BCRYPT_PAD_PSS.
 	bcryptPadPSSFlag = 0x00000008
@@ -241,7 +247,7 @@ func createPersistedKey(provider windows.Handle, name *uint16) (windows.Handle, 
 		uintptr(unsafe.Pointer(algorithm)),
 		uintptr(unsafe.Pointer(name)),
 		0,
-		uintptr(ncryptUseVirtualIsolationFlag|ncryptOverwriteKeyFlag),
+		uintptr(ncryptUseVirtualIsolationFlag|ncryptUsePerBootKeyFlag|ncryptOverwriteKeyFlag),
 	)
 	if status != 0 {
 		if statusCode(status) == nteExists {
@@ -271,6 +277,31 @@ func createPersistedKey(provider windows.Handle, name *uint16) (windows.Handle, 
 	return key, nil
 }
 
+// keyCanSign reports whether an opened key can still perform a private-key
+// operation. A per-boot KeyGuard key leaves its metadata on disk when the
+// machine reboots, so the key opens and still reports "Virtual Iso", but the
+// isolated material behind it is gone. Only attempting to use it tells the
+// difference, and doing so here turns a confusing failure during the TLS
+// handshake into a clean re-mint.
+func keyCanSign(key windows.Handle) bool {
+	algID, err := algorithmIdentifier(crypto.SHA256)
+	if err != nil {
+		return false
+	}
+	digest := make([]byte, crypto.SHA256.Size())
+	padInfo := bcryptPKCS1PaddingInfo{pszAlgID: algID}
+	defer runtime.KeepAlive(algID)
+	defer runtime.KeepAlive(&padInfo)
+
+	var needed uint32
+	status, _, _ := syscall.SyscallN(procNCryptSignHash.Addr(),
+		uintptr(key), uintptr(unsafe.Pointer(&padInfo)),
+		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
+		0, 0, uintptr(unsafe.Pointer(&needed)), bcryptPadPKCS1Flag|ncryptSilentFlag,
+	)
+	return status == 0
+}
+
 // getOrCreateKey returns the binding key called name, creating it when absent.
 func (keyGuardProvider) getOrCreateKey(name string) (bindingKey, error) {
 	keyName, err := windows.UTF16PtrFromString(name)
@@ -286,6 +317,13 @@ func (keyGuardProvider) getOrCreateKey(name string) (bindingKey, error) {
 	if err != nil {
 		freeNCryptObject(provider)
 		return bindingKey{}, err
+	}
+	if existed && !keyCanSign(key) {
+		// The key survived a reboot in name only. Replacing it changes the
+		// public key, so any certificate already issued against the old one is
+		// worthless; the caller discards its cache when the key is replaced.
+		freeNCryptObject(key)
+		existed = false
 	}
 	if !existed {
 		if key, err = createPersistedKey(provider, keyName); err != nil {
