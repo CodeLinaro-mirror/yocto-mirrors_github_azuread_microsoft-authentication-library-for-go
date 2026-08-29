@@ -216,6 +216,19 @@ stages:
                 }
                 Write-Host "##vso[task.prependpath]$native"
           - task: PowerShell@2
+            displayName: "TEMP: probe reachability of the token-binding vault"
+            continueOnError: true
+            inputs:
+              targetType: "inline"
+              script: |
+                # A bare TCP reset during the TLS handshake looks the same whether the agent cannot
+                # reach the vault at all or the vault refused what the Go client offered. curl uses a
+                # different TLS stack over the same egress path, so a well-formed HTTP response here
+                # separates the two.
+                $vault = "tokenbindingdemo.vault.azure.net"
+                Test-NetConnection $vault -Port 443 -InformationLevel Detailed
+                curl.exe -sS -v --max-time 30 "https://$vault/secrets/boundsecret?api-version=7.4" 2>&1 | Select-Object -First 60
+          - task: PowerShell@2
             displayName: "Run Managed Identity IMDS E2E Tests"
             inputs:
               targetType: "inline"

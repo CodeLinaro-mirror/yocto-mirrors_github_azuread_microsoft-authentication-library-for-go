@@ -338,7 +338,14 @@ func TestIMDSv2BoundTokenIsRejectedWithoutCertificate(t *testing.T) {
 func getBoundSecret(ctx context.Context, url, token string, cert tls.Certificate) (string, int, error) {
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 	if len(cert.Certificate) > 0 {
-		tlsConfig.Certificates = []tls.Certificate{cert}
+		// Go matches tls.Config.Certificates against the certificate authorities the server says
+		// it accepts, and silently sends nothing when none match. A binding certificate is issued
+		// by an internal CA the resource is not obliged to advertise, so selecting it through this
+		// callback is what guarantees it is actually presented rather than dropped, which would be
+		// indistinguishable from the negative case below.
+		tlsConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return &cert, nil
+		}
 	}
 	client := &http.Client{
 		Timeout:   30 * time.Second,
