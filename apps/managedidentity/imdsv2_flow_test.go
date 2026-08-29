@@ -219,8 +219,11 @@ func (f *imdsFake) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	// Real IMDS omits vmssId entirely on a standalone VM rather than sending it
+	// empty. The fixture matches a captured response: inventing a shape the
+	// service never sends is what let a bad CUID attribute reach production.
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"cuId":                map[string]string{"vmId": "vm-1", "vmssId": "vmss-1"},
+		"cuId":                map[string]string{"vmId": "vm-1"},
 		"clientId":            f.clientID,
 		"tenantId":            f.tenantID,
 		"attestationEndpoint": "https://attestation.example",

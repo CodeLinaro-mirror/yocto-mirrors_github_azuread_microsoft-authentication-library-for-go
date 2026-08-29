@@ -13,7 +13,6 @@ import (
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"io"
 	"strings"
 	"testing"
@@ -214,16 +213,57 @@ func TestCreateCSRStructure(t *testing.T) {
 	if _, err := asn1.UnmarshalWithParams(attr.Values[0].FullBytes, &gotJSON, "utf8"); err != nil {
 		t.Fatalf("the CUID attribute is not a UTF8String: %v", err)
 	}
-	wantJSON, err := json.Marshal(cuid)
-	if err != nil {
-		t.Fatalf("marshaling the expected CUID: %v", err)
-	}
-	if gotJSON != string(wantJSON) {
+	// Pinned as a literal rather than round-tripped through json.Marshal: IMDS
+	// validates this string against the cuId it handed out, so comparing the
+	// encoder with itself would accept any shape it happens to produce. A
+	// standalone VM's cuId carries no vmssId member, and emitting an empty one
+	// makes the service reject the CSR.
+	wantJSON := `{"vmId":"` + testCSRVMID + `"}`
+	if gotJSON != wantJSON {
 		t.Errorf("CUID attribute = %s, want %s", gotJSON, wantJSON)
 	}
-	// The field names travel to IMDS verbatim, so pin them.
-	if !strings.Contains(gotJSON, `"vmId"`) || !strings.Contains(gotJSON, `"vmssId"`) {
-		t.Errorf("CUID JSON = %s, want it to use the vmId and vmssId names", gotJSON)
+}
+
+// TestCreateCSRCuidOmitsAbsentMembers pins the exact JSON for each shape of cuId
+// IMDS can hand out. The value is echoed inside the signed attribute and the
+// service compares it with what it issued, so an extra empty member is not
+// cosmetic: it is the difference between a certificate and a 400.
+func TestCreateCSRCuidOmitsAbsentMembers(t *testing.T) {
+	key := testCSRKey(t)
+	for _, test := range []struct {
+		name string
+		cuid cuidInfo
+		want string
+	}{
+		{"standalone VM", cuidInfo{VMID: testCSRVMID}, `{"vmId":"` + testCSRVMID + `"}`},
+		{"scale set member", cuidInfo{VMSSID: "scale-set-1"}, `{"vmssId":"scale-set-1"}`},
+		{"both", cuidInfo{VMID: testCSRVMID, VMSSID: "scale-set-1"}, `{"vmId":"` + testCSRVMID + `","vmssId":"scale-set-1"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			csr, err := createCSR(key, testCSRClientID, testCSRTenantID, test.cuid)
+			if err != nil {
+				t.Fatalf("createCSR: %v", err)
+			}
+			der, err := base64.StdEncoding.DecodeString(csr)
+			if err != nil {
+				t.Fatalf("decoding the CSR: %v", err)
+			}
+			var req certificationRequest
+			if _, err := asn1.Unmarshal(der, &req); err != nil {
+				t.Fatalf("parsing the CSR: %v", err)
+			}
+			var info certificationRequestInfo
+			if _, err := asn1.Unmarshal(req.Info.FullBytes, &info); err != nil {
+				t.Fatalf("parsing the CSR body: %v", err)
+			}
+			var gotJSON string
+			if _, err := asn1.UnmarshalWithParams(info.Attributes[0].Values[0].FullBytes, &gotJSON, "utf8"); err != nil {
+				t.Fatalf("the CUID attribute is not a UTF8String: %v", err)
+			}
+			if gotJSON != test.want {
+				t.Errorf("CUID attribute = %s, want %s", gotJSON, test.want)
+			}
+		})
 	}
 }
 

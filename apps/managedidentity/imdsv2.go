@@ -48,9 +48,14 @@ const (
 // scale set member.
 //
 // These names are camelCase because that is what /getplatformmetadata returns.
+//
+// Both fields are omitempty because this value is echoed back inside the signed
+// CSR attribute and IMDS validates it against what it issued. A standalone VM
+// gets {"vmId":"..."} with no vmssId member at all, so emitting an empty vmssId
+// makes the service reject the CSR.
 type cuidInfo struct {
-	VMID   string `json:"vmId"`
-	VMSSID string `json:"vmssId"`
+	VMID   string `json:"vmId,omitempty"`
+	VMSSID string `json:"vmssId,omitempty"`
 }
 
 func (c cuidInfo) isEmpty() bool {
