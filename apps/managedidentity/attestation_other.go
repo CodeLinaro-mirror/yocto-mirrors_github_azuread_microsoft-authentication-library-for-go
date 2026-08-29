@@ -10,5 +10,5 @@ package managedidentity
 // ships only for Windows, so every other platform reports the capability as
 // absent.
 func attestKeyGuard(endpoint, clientID string, key bindingKey) (string, error) {
-	return "", errAttestationUnavailable
+	return "", ErrAttestationUnavailable
 }

@@ -371,10 +371,12 @@ func (f *imdsFake) newTestClient(t *testing.T, id ID, provider keyProvider) Clie
 func withCleanCaches(t *testing.T) {
 	t.Helper()
 	certCache.clear()
+	clearAttestationCache()
 	cacheManager = storage.New(nil)
 	platformSupportsMtlsPoP = func() bool { return true }
 	t.Cleanup(func() {
 		certCache.clear()
+		clearAttestationCache()
 		cacheManager = storage.New(nil)
 		platformSupportsMtlsPoP = func() bool { return runtime.GOOS == "windows" }
 	})
@@ -435,7 +437,7 @@ func TestIMDSv2SendsAttestationTokenWhenOptedIn(t *testing.T) {
 // the caller requested.
 func TestIMDSv2FailsWhenAttestationUnavailable(t *testing.T) {
 	withCleanCaches(t)
-	withStubAttestation(t, "", errAttestationUnavailable)
+	withStubAttestation(t, "", ErrAttestationUnavailable)
 	fake := newIMDSFake(t)
 	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
 
@@ -443,8 +445,8 @@ func TestIMDSv2FailsWhenAttestationUnavailable(t *testing.T) {
 	if err == nil {
 		t.Fatal("AcquireToken succeeded, so the caller was silently given a non-attested credential")
 	}
-	if !errors.Is(err, errAttestationUnavailable) {
-		t.Fatalf("error = %v, want it to wrap errAttestationUnavailable", err)
+	if !errors.Is(err, ErrAttestationUnavailable) {
+		t.Fatalf("error = %v, want it to wrap ErrAttestationUnavailable", err)
 	}
 	for _, call := range fake.calls {
 		if call == "issue" {
@@ -496,6 +498,189 @@ func TestIMDSv2AttestedAndNonAttestedCertificatesDoNotShareCache(t *testing.T) {
 				t.Fatalf("attestation token on the second request = %q, want %q", fake.lastAttestationToken, tc.wantSecond)
 			}
 		})
+	}
+}
+
+// stubAttestationJWT builds a token shaped like an MAA statement, carrying the
+// expiry the cache reads. The signature is not verified anywhere in this flow,
+// so an unsigned third segment is enough.
+func stubAttestationJWT(t *testing.T, exp time.Time) string {
+	t.Helper()
+	enc := func(v any) string {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	header := enc(map[string]string{"alg": "none", "typ": "JWT"})
+	payload := enc(map[string]any{"exp": exp.Unix(), "iss": "https://maa.test"})
+	return header + "." + payload + ".stub-signature"
+}
+
+// withCountedAttestation substitutes the attestation provider with one that
+// returns whatever tokenFor produces and counts how often it is reached, which
+// is what makes a cache hit observable.
+func withCountedAttestation(t *testing.T, tokenFor func() string) *int {
+	t.Helper()
+	calls := 0
+	original := attestKeyGuardFn
+	attestKeyGuardFn = func(endpoint, clientID string, key bindingKey) (string, error) {
+		calls++
+		return tokenFor(), nil
+	}
+	t.Cleanup(func() { attestKeyGuardFn = original })
+	return &calls
+}
+
+// Two identities on the same host share one binding key, so MAA has already
+// vouched for the key by the time the second certificate is minted.
+func TestIMDSv2ReusesAttestationTokenForTheSameKey(t *testing.T) {
+	withCleanCaches(t)
+	token := stubAttestationJWT(t, time.Now().Add(time.Hour))
+	calls := withCountedAttestation(t, func() string { return token })
+	fake := newIMDSFake(t)
+	provider := newFakeKeyProvider()
+
+	system := fake.newTestClient(t, SystemAssigned(), provider)
+	if _, err := system.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
+		t.Fatalf("system-assigned AcquireToken: %v", err)
+	}
+	user := fake.newTestClient(t, UserAssignedClientID("11111111-2222-3333-4444-555555555555"), provider)
+	if _, err := user.AcquireToken(context.Background(), "https://storage.azure.com", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
+		t.Fatalf("user-assigned AcquireToken: %v", err)
+	}
+
+	if provider.creates != 1 {
+		t.Fatalf("created %d keys, want 1: the test needs both identities to share a binding key", provider.creates)
+	}
+	if *calls != 1 {
+		t.Fatalf("attested %d times, want 1: the second certificate should have reused the cached statement", *calls)
+	}
+	if fake.lastAttestationToken != token {
+		t.Fatalf("the second request sent %q, want the cached statement", fake.lastAttestationToken)
+	}
+}
+
+// A statement close enough to its expiry could lapse before the service reads
+// it, so the cache stops serving it before it actually expires.
+func TestIMDSv2ReattestsWhenTheAttestationTokenNearsExpiry(t *testing.T) {
+	withCleanCaches(t)
+	realNow := now
+	base := realNow()
+	current := base
+	now = func() time.Time { return current }
+	t.Cleanup(func() { now = realNow })
+
+	calls := withCountedAttestation(t, func() string { return stubAttestationJWT(t, base.Add(10*time.Minute)) })
+	fake := newIMDSFake(t)
+	provider := newFakeKeyProvider()
+
+	client := fake.newTestClient(t, SystemAssigned(), provider)
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
+		t.Fatalf("first AcquireToken: %v", err)
+	}
+	if *calls != 1 {
+		t.Fatalf("attested %d times on the first acquisition, want 1", *calls)
+	}
+
+	// Six minutes on, the statement has four minutes left, which is inside the
+	// five-minute buffer.
+	current = base.Add(6 * time.Minute)
+	certCache.clear()
+	if _, err := client.AcquireToken(context.Background(), "https://storage.azure.com", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
+		t.Fatalf("second AcquireToken: %v", err)
+	}
+	if *calls != 2 {
+		t.Fatalf("attested %d times, want 2: a statement inside the expiry buffer should not be served", *calls)
+	}
+}
+
+// A statement vouches for one key. If the key behind a container is replaced,
+// the cached statement describes a key that is no longer in use and must not be
+// sent with a request carrying the new one.
+func TestIMDSv2ReattestsWhenTheBindingKeyChanges(t *testing.T) {
+	withCleanCaches(t)
+	calls := withCountedAttestation(t, func() string { return stubAttestationJWT(t, time.Now().Add(time.Hour)) })
+	fake := newIMDSFake(t)
+	provider := newFakeKeyProvider()
+
+	client := fake.newTestClient(t, SystemAssigned(), provider)
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
+		t.Fatalf("first AcquireToken: %v", err)
+	}
+
+	// The container keeps its name while the key inside it changes, which is
+	// what a name-based cache key would fail to notice.
+	provider.rotate(t, bindingKeyName)
+	certCache.clear()
+	if _, err := client.AcquireToken(context.Background(), "https://storage.azure.com", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
+		t.Fatalf("second AcquireToken: %v", err)
+	}
+	if *calls != 2 {
+		t.Fatalf("attested %d times, want 2: the statement for the replaced key should not have been reused", *calls)
+	}
+}
+
+// A statement with no readable lifetime is still usable, but there is no basis
+// for deciding when to stop trusting it, so it is not stored.
+func TestIMDSv2DoesNotCacheAttestationTokenWithoutExpiry(t *testing.T) {
+	withCleanCaches(t)
+	calls := withCountedAttestation(t, func() string { return "not-a-jwt" })
+	fake := newIMDSFake(t)
+	provider := newFakeKeyProvider()
+
+	client := fake.newTestClient(t, SystemAssigned(), provider)
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
+		t.Fatalf("first AcquireToken: %v", err)
+	}
+	if fake.lastAttestationToken != "not-a-jwt" {
+		t.Fatalf("attestation token = %q, want it sent even though it is not cacheable", fake.lastAttestationToken)
+	}
+	certCache.clear()
+	if _, err := client.AcquireToken(context.Background(), "https://storage.azure.com", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
+		t.Fatalf("second AcquireToken: %v", err)
+	}
+	if *calls != 2 {
+		t.Fatalf("attested %d times, want 2: a token with no readable expiry should not be cached", *calls)
+	}
+}
+
+// The endpoint belongs in the cache key because MAA instances issue their own
+// statements: one region's token is not valid at another. Trailing slashes and
+// casing are incidental to that identity, so they are normalized away.
+func TestAttestationCacheKeySeparatesEndpoints(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := bindingKey{Signer: key, Type: keyTypeKeyGuard}
+
+	keyFor := func(endpoint string, bk bindingKey) string {
+		t.Helper()
+		got, err := attestationCacheKey(endpoint, bk)
+		if err != nil {
+			t.Fatalf("attestationCacheKey(%q): %v", endpoint, err)
+		}
+		return got
+	}
+
+	eastus := keyFor("https://eastus.attest.azure.net", bound)
+	if got := keyFor("https://EastUS.attest.azure.net/", bound); got != eastus {
+		t.Errorf("trailing slash and casing changed the key:\n got %q\nwant %q", got, eastus)
+	}
+	if got := keyFor("https://westus.attest.azure.net", bound); got == eastus {
+		t.Error("two regions produced the same key, so a statement could be reused at an endpoint that did not issue it")
+	}
+	if got := keyFor("https://eastus.attest.azure.net", bindingKey{Signer: other, Type: keyTypeKeyGuard}); got == eastus {
+		t.Error("two keys produced the same cache key, so a statement could vouch for the wrong key")
+	}
+	if _, err := attestationCacheKey("https://eastus.attest.azure.net", bindingKey{}); err == nil {
+		t.Error("a binding key with no signer should not produce a cache key")
 	}
 }
 

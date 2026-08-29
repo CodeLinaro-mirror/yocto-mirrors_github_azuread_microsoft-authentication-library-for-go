@@ -91,8 +91,9 @@ func attestationLogThunk(ctx uintptr, tag *byte, level uintptr, function *byte, 
 }
 
 // loadAttestationLib resolves the native library once. A missing library is
-// reported as errAttestationUnavailable so the caller can fall back, while a
-// library that is present but unusable produces a real error.
+// reported as ErrAttestationUnavailable so the caller can tell a deployment gap
+// apart from a real failure, while a library that is present but unusable
+// produces a real error.
 func loadAttestationLib() (*attestationLib, error) {
 	attestationLibOnce.Do(func() {
 		dll := windows.NewLazyDLL(attestationLibName)
@@ -108,7 +109,7 @@ func loadAttestationLib() (*attestationLib, error) {
 				attestationLibErr = fmt.Errorf("loading %s: %v; the library is present but could not be loaded, which usually means a dependency is missing, such as the Visual C++ runtime (MSVCP140.dll, VCRUNTIME140.dll)", path, err)
 				return
 			}
-			attestationLibErr = fmt.Errorf("%w: loading %s: %v", errAttestationUnavailable, attestationLibName, err)
+			attestationLibErr = fmt.Errorf("%w: loading %s: %v", ErrAttestationUnavailable, attestationLibName, err)
 			return
 		}
 		initLib := dll.NewProc("InitAttestationLib")
@@ -116,7 +117,7 @@ func loadAttestationLib() (*attestationLib, error) {
 		free := dll.NewProc("FreeAttestationToken")
 		for _, p := range []*windows.LazyProc{initLib, attest, free} {
 			if err := p.Find(); err != nil {
-				attestationLibErr = fmt.Errorf("%w: %s is missing %s: %v", errAttestationUnavailable, attestationLibName, p.Name, err)
+				attestationLibErr = fmt.Errorf("%w: %s is missing %s: %v", ErrAttestationUnavailable, attestationLibName, p.Name, err)
 				return
 			}
 		}
@@ -170,20 +171,20 @@ func findAttestationLib() (string, error) {
 }
 
 // attestKeyGuard asks the native library for an MAA statement over key. It
-// returns errAttestationUnavailable when the library is not deployed, so the
+// returns ErrAttestationUnavailable when the library is not deployed, so the
 // caller can tell an undeployed library apart from a statement the service
 // refused.
 func attestKeyGuard(endpoint, clientID string, key bindingKey) (string, error) {
-	// Only a VBS-isolated key can be attested. MSAL .NET gates on the same
-	// condition and sends a non-attested request for software and TPM keys,
-	// because MAA has nothing to vouch for when the private material never
-	// entered a trustlet.
+	// Only a VBS-isolated key can be attested: MAA has nothing to vouch for
+	// when the private material never entered a trustlet. A caller who asked
+	// for attestation and holds a software or TPM key is told so rather than
+	// downgraded, which is also how MSAL .NET treats a key that is not RSACng.
 	if key.Type != keyTypeKeyGuard {
-		return "", fmt.Errorf("%w: the binding key is not KeyGuard-isolated", errAttestationUnavailable)
+		return "", fmt.Errorf("%w: the binding key is not KeyGuard-isolated", ErrAttestationUnavailable)
 	}
 	signer, ok := key.Signer.(*ncryptSigner)
 	if !ok {
-		return "", fmt.Errorf("%w: the binding key is not a CNG key", errAttestationUnavailable)
+		return "", fmt.Errorf("%w: the binding key is not a CNG key", ErrAttestationUnavailable)
 	}
 	lib, err := loadAttestationLib()
 	if err != nil {

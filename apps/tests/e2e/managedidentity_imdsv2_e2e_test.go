@@ -99,7 +99,7 @@ func skipUnlessIMDSv2(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	_, err = client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession())
+	_, err = client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession(), mi.WithAttestationSupport())
 	switch {
 	case err == nil:
 		return
@@ -109,6 +109,8 @@ func skipUnlessIMDSv2(t *testing.T) {
 		skipOrFail(t, "Credential Guard is not enabled on this host")
 	case errors.Is(err, mi.ErrMtlsNotSupportedForPlatform):
 		skipOrFail(t, "this platform cannot produce a KeyGuard key")
+	case errors.Is(err, mi.ErrAttestationUnavailable):
+		skipOrFail(t, "AttestationClientLib.dll is not on this host, so the attested path cannot run")
 	case strings.Contains(err.Error(), "identity_not_found"):
 		skipOrFail(t, "no managed identity is assigned to this host")
 	default:
@@ -128,7 +130,7 @@ func TestIMDSv2SystemAssignedBoundToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	res, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession())
+	res, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession(), mi.WithAttestationSupport())
 	if err != nil {
 		t.Fatalf("AcquireToken: %v", err)
 	}
@@ -174,7 +176,7 @@ func TestIMDSv2UserAssignedBoundToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	res, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession())
+	res, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession(), mi.WithAttestationSupport())
 	if err != nil {
 		t.Fatalf("AcquireToken: %v", err)
 	}
@@ -198,7 +200,7 @@ func TestIMDSv2BearerOverMtls(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	res, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithRequestOverMtls())
+	res, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithRequestOverMtls(), mi.WithAttestationSupport())
 	if err != nil {
 		t.Fatalf("AcquireToken: %v", err)
 	}
@@ -227,11 +229,11 @@ func TestIMDSv2TokenIsServedFromCache(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	first, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession())
+	first, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession(), mi.WithAttestationSupport())
 	if err != nil {
 		t.Fatalf("first AcquireToken: %v", err)
 	}
-	second, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession())
+	second, err := client.AcquireToken(ctx, imdsV2Resource, mi.WithMtlsProofOfPossession(), mi.WithAttestationSupport())
 	if err != nil {
 		t.Fatalf("second AcquireToken: %v", err)
 	}
@@ -273,7 +275,7 @@ func TestIMDSv2CallsBoundResource(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	res, err := client.AcquireToken(ctx, imdsV2VaultResource, mi.WithMtlsProofOfPossession())
+	res, err := client.AcquireToken(ctx, imdsV2VaultResource, mi.WithMtlsProofOfPossession(), mi.WithAttestationSupport())
 	if err != nil {
 		t.Fatalf("AcquireToken: %v", err)
 	}
@@ -328,7 +330,7 @@ func TestIMDSv2BoundTokenIsRejectedWithoutCertificate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	res, err := client.AcquireToken(ctx, imdsV2VaultResource, mi.WithMtlsProofOfPossession())
+	res, err := client.AcquireToken(ctx, imdsV2VaultResource, mi.WithMtlsProofOfPossession(), mi.WithAttestationSupport())
 	if err != nil {
 		t.Fatalf("AcquireToken: %v", err)
 	}

@@ -191,7 +191,7 @@ func (v imdsV2) issueBindingCertificate(ctx context.Context, correlationID strin
 	// fewer guarantees than the one requested.
 	var attestationToken string
 	if attested {
-		attestationToken, err = attestKeyGuardFn(metadata.AttestationEndpoint, metadata.ClientID, key)
+		attestationToken, err = attestKeyGuardCached(metadata.AttestationEndpoint, metadata.ClientID, key)
 		if err != nil {
 			_ = key.Close()
 			return nil, err
