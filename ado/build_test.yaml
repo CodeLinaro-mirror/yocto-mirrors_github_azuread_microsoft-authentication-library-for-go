@@ -202,8 +202,14 @@ stages:
                 $nupkg = "$dir\$pkg.$ver.nupkg"
                 $url = "https://pkgs.dev.azure.com/IdentityDivision/_packaging/IDDP_PublicPackages/nuget/v3/flat2/$pkg/$ver/$pkg.$ver.nupkg"
                 Invoke-WebRequest -Headers @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" } -Uri $url -OutFile $nupkg
-                Expand-Archive -Path $nupkg -DestinationPath "$dir\extracted" -Force
-                $native = "$dir\extracted\runtimes\win-x64\native"
+                Write-Host "downloaded $((Get-Item $nupkg).Length) bytes"
+                # A .nupkg is a zip, but Expand-Archive rejects the extension, so
+                # unpack it through the API that goes by content instead of name.
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                $extracted = "$dir\extracted"
+                if (Test-Path $extracted) { Remove-Item -Recurse -Force $extracted }
+                [IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $extracted)
+                $native = "$extracted\runtimes\win-x64\native"
                 Get-ChildItem $native | ForEach-Object { Write-Host "  $($_.Name) $($_.Length) bytes" }
                 if (-not (Test-Path "$native\AttestationClientLib.dll")) {
                   throw "AttestationClientLib.dll was not found in the package"
