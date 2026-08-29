@@ -4,12 +4,15 @@
 package managedidentity
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"strings"
@@ -29,6 +32,78 @@ func testCSRKey(t *testing.T) *rsa.PrivateKey {
 		t.Fatalf("generating a test key: %v", err)
 	}
 	return key
+}
+
+// TestCSRMatchesDotNetEncoding pins the parts of the request that are byte
+// exact regardless of the key, because IMDS rejected earlier encodings that
+// every Go parser accepted.
+//
+// The expected bytes were taken from a CSR produced by MSAL .NET for the same
+// inputs and compared byte for byte. Three of these deviations were live bugs:
+// an explicit trailerField, which DER forbids because it repeats the DEFAULT,
+// and a NULL parameter on each of the two SHA-256 identifiers, which RFC 4055
+// says a sender should leave out. crypto/x509 accepts all three, so only a
+// fixed encoding catches them.
+func TestCSRMatchesDotNetEncoding(t *testing.T) {
+	const wantSigAlg = "303d06092a864886f70d01010a3030" +
+		"a00d300b0609608648016503040201" +
+		"a11a301806092a864886f70d010108300b0609608648016503040201" +
+		"a203020120"
+
+	key := testCSRKey(t)
+	csr, err := createCSR(key, testCSRClientID, testCSRTenantID, cuidInfo{VMID: testCSRVMID})
+	if err != nil {
+		t.Fatalf("createCSR: %v", err)
+	}
+	der, err := base64.StdEncoding.DecodeString(csr)
+	if err != nil {
+		t.Fatalf("the CSR is not valid base64: %v", err)
+	}
+
+	var req certificationRequest
+	if _, err := asn1.Unmarshal(der, &req); err != nil {
+		t.Fatalf("parsing the CSR: %v", err)
+	}
+	sigAlgDER, err := asn1.Marshal(req.SignatureAlgorithm)
+	if err != nil {
+		t.Fatalf("re-marshaling the signature algorithm: %v", err)
+	}
+	if got := hex.EncodeToString(sigAlgDER); got != wantSigAlg {
+		t.Errorf("signature algorithm DER\n got %s\nwant %s", got, wantSigAlg)
+	}
+
+	// The domain component must be an IA5String. A plain Go string encodes as
+	// a PrintableString, which IMDS rejects.
+	parsed, err := x509.ParseCertificateRequest(der)
+	if err != nil {
+		t.Fatalf("crypto/x509 rejected the CSR: %v", err)
+	}
+	var rdns pkix.RDNSequence
+	if _, err := asn1.Unmarshal(parsed.RawSubject, &rdns); err != nil {
+		t.Fatalf("parsing the subject: %v", err)
+	}
+	var checkedDC bool
+	for _, rdn := range rdns {
+		for _, atv := range rdn {
+			if !atv.Type.Equal(oidDomainComponent) {
+				continue
+			}
+			checkedDC = true
+			raw, ok := atv.Value.(string)
+			if !ok {
+				t.Fatalf("the domain component parsed as %T, want a string", atv.Value)
+			}
+			if raw != testCSRTenantID {
+				t.Errorf("DC = %q, want %q", raw, testCSRTenantID)
+			}
+		}
+	}
+	if !checkedDC {
+		t.Fatal("the subject has no domain component")
+	}
+	if !bytes.Contains(parsed.RawSubject, append([]byte{byte(asn1.TagIA5String), byte(len(testCSRTenantID))}, testCSRTenantID...)) {
+		t.Errorf("the domain component is not encoded as an IA5String: % x", parsed.RawSubject)
+	}
 }
 
 // TestCreateCSRIsValidPKCS10 checks the hand-rolled DER against an independent

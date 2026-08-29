@@ -60,20 +60,25 @@ type certificationRequest struct {
 // rsaPSSParams mirrors RSASSA-PSS-params from RFC 4055 for SHA-256 with an
 // equal-length salt. Every field is explicitly tagged because each one carries
 // a DEFAULT that refers to SHA-1.
+//
+// TrailerField is optional with a default so that the value 1 is left out of
+// the encoding. DER requires a field equal to its DEFAULT to be omitted, and
+// IMDS rejects a request that spells it out.
 type rsaPSSParams struct {
 	Hash         pkix.AlgorithmIdentifier `asn1:"explicit,tag:0"`
 	MaskGen      pkix.AlgorithmIdentifier `asn1:"explicit,tag:1"`
 	SaltLength   int                      `asn1:"explicit,tag:2"`
-	TrailerField int                      `asn1:"explicit,tag:3"`
+	TrailerField int                      `asn1:"explicit,tag:3,optional,default:1"`
 }
 
 // pssSHA256AlgorithmIdentifier returns the AlgorithmIdentifier describing
 // RSASSA-PSS with SHA-256, MGF1-SHA-256 and a 32 byte salt.
+//
+// The SHA-256 identifier carries no parameters at all. RFC 4055 section 2.1
+// allows either an absent parameter or an explicit NULL, but it says a sender
+// SHOULD omit it, and that is what IMDS accepts.
 func pssSHA256AlgorithmIdentifier() (pkix.AlgorithmIdentifier, error) {
-	sha256AlgID := pkix.AlgorithmIdentifier{
-		Algorithm:  oidSHA256,
-		Parameters: asn1.NullRawValue,
-	}
+	sha256AlgID := pkix.AlgorithmIdentifier{Algorithm: oidSHA256}
 	sha256DER, err := asn1.Marshal(sha256AlgID)
 	if err != nil {
 		return pkix.AlgorithmIdentifier{}, fmt.Errorf("managedidentity: marshaling SHA-256 algorithm identifier: %w", err)
@@ -127,9 +132,24 @@ func createCSR(signer crypto.Signer, clientID, tenantID string, cuid cuidInfo) (
 
 	// RFC 4514 renders an RDNSequence in reverse, so encoding DC before CN
 	// yields the string form "CN={clientID}, DC={tenantID}".
+	//
+	// The domain component is an IA5String. RFC 4519 defines it that way, and
+	// it is what MSAL .NET puts on the wire, so the value is encoded
+	// explicitly: a plain Go string would become a PrintableString and IMDS
+	// rejects the resulting subject.
+	dcValue, err := asn1.MarshalWithParams(tenantID, "ia5")
+	if err != nil {
+		return "", fmt.Errorf("managedidentity: marshaling the CSR domain component: %w", err)
+	}
 	subjectDER, err := asn1.Marshal(pkix.RDNSequence{
-		[]pkix.AttributeTypeAndValue{{Type: oidDomainComponent, Value: tenantID}},
-		[]pkix.AttributeTypeAndValue{{Type: oidCommonName, Value: clientID}},
+		pkix.RelativeDistinguishedNameSET{{
+			Type:  oidDomainComponent,
+			Value: asn1.RawValue{FullBytes: dcValue},
+		}},
+		pkix.RelativeDistinguishedNameSET{{
+			Type:  oidCommonName,
+			Value: clientID,
+		}},
 	})
 	if err != nil {
 		return "", fmt.Errorf("managedidentity: marshaling the CSR subject: %w", err)
