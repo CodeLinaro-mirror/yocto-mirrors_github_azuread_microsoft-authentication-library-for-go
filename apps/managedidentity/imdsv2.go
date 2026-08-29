@@ -1,0 +1,238 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+package managedidentity
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"syscall"
+)
+
+// wsaeConnReset is WSAECONNRESET. Windows reports a peer-side connection reset
+// with this Winsock code rather than the POSIX ECONNRESET value.
+const wsaeConnReset = 10054
+
+// IMDSv2 issues a short-lived, VM-bound X.509 certificate that is then used as
+// a TLS client certificate against a regional Entra endpoint. Acquiring a token
+// takes three legs:
+//
+//  1. GET  /metadata/identity/getplatformmetadata  - learn the client ID,
+//     tenant ID and compute identifier this VM should request a credential for.
+//  2. POST /metadata/identity/issuecredential      - exchange a CSR, signed by a
+//     KeyGuard key, for a certificate signed by IMDS.
+//  3. POST {mtls_authentication_endpoint}/{tenant}/oauth2/v2.0/token - present
+//     that certificate over mTLS and receive an mTLS proof-of-possession or
+//     bearer token.
+//
+// Legs 1 and 2 speak plain HTTP to the link-local address; only leg 3 uses TLS.
+const (
+	imdsV2DefaultBaseEndpoint    = "http://169.254.169.254"
+	imdsV2CsrMetadataPath        = "/metadata/identity/getplatformmetadata"
+	imdsV2IssueCredentialPath    = "/metadata/identity/issuecredential"
+	imdsV2OAuthPath              = "/oauth2/v2.0/token"
+	imdsV2APIVersionQueryParam   = "cred-api-version"
+	imdsV2APIVersion             = "2.0"
+	imdsV2MetadataHeader         = "Metadata"
+	imdsV2CorrelationIDHeader    = "X-Ms-Correlation-Id"
+	imdsV2ClientRequestIDHeader  = "x-ms-client-request-id"
+	imdsV2ServerHeader           = "Server"
+	imdsV2ServerHeaderIdentifier = "IMDS"
+)
+
+// cuidInfo is the compute unique identifier IMDS reports for this host. Exactly
+// one of the two fields is populated: VMID for a standalone VM and VMSSID for a
+// scale set member.
+//
+// These names are camelCase because that is what /getplatformmetadata returns.
+type cuidInfo struct {
+	VMID   string `json:"vmId"`
+	VMSSID string `json:"vmssId"`
+}
+
+func (c cuidInfo) isEmpty() bool {
+	return c.VMID == "" && c.VMSSID == ""
+}
+
+// csrMetadata is the /getplatformmetadata response.
+//
+// Note the casing: this endpoint answers in camelCase while /issuecredential
+// answers in snake_case. The two are genuinely inconsistent, so the struct tags
+// here and on certificateRequestResponse must not be made uniform.
+type csrMetadata struct {
+	CuID                cuidInfo `json:"cuId"`
+	ClientID            string   `json:"clientId"`
+	TenantID            string   `json:"tenantId"`
+	AttestationEndpoint string   `json:"attestationEndpoint"`
+}
+
+func (m csrMetadata) validate() error {
+	switch {
+	case m.ClientID == "":
+		return fmt.Errorf("managedidentity: IMDS returned platform metadata without a clientId")
+	case m.TenantID == "":
+		return fmt.Errorf("managedidentity: IMDS returned platform metadata without a tenantId")
+	case m.CuID.isEmpty():
+		return fmt.Errorf("managedidentity: IMDS returned platform metadata without a vmId or vmssId")
+	}
+	return nil
+}
+
+// certificateRequestBody is the /issuecredential request. AttestationToken is
+// omitted entirely when attestation is not in use, which is what IMDS expects
+// for a non-attested request.
+type certificateRequestBody struct {
+	CSR              string `json:"csr"`
+	AttestationToken string `json:"attestation_token,omitempty"`
+}
+
+// certificateRequestResponse is the /issuecredential response.
+//
+// Unlike csrMetadata, this endpoint uses snake_case. See the note there.
+type certificateRequestResponse struct {
+	ClientID                   string `json:"client_id"`
+	TenantID                   string `json:"tenant_id"`
+	Certificate                string `json:"certificate"`
+	IdentityType               string `json:"identity_type"`
+	MtlsAuthenticationEndpoint string `json:"mtls_authentication_endpoint"`
+}
+
+func (r certificateRequestResponse) validate() error {
+	missing := make([]string, 0, 5)
+	if r.ClientID == "" {
+		missing = append(missing, "client_id")
+	}
+	if r.TenantID == "" {
+		missing = append(missing, "tenant_id")
+	}
+	if r.Certificate == "" {
+		missing = append(missing, "certificate")
+	}
+	if r.IdentityType == "" {
+		missing = append(missing, "identity_type")
+	}
+	if r.MtlsAuthenticationEndpoint == "" {
+		missing = append(missing, "mtls_authentication_endpoint")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("managedidentity: IMDS issued a credential response missing %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// validateIMDSServerHeader rejects a response that does not look like it came
+// from IMDS. Because the IMDS legs are unauthenticated plain HTTP to a
+// link-local address, this header is the only signal that the responder is the
+// real instance metadata service rather than something else that answered on
+// that address.
+func validateIMDSServerHeader(resp *http.Response) error {
+	server := resp.Header.Get(imdsV2ServerHeader)
+	if server == "" {
+		return fmt.Errorf("managedidentity: the IMDS response has no %s header", imdsV2ServerHeader)
+	}
+	if !strings.Contains(strings.ToUpper(server), imdsV2ServerHeaderIdentifier) {
+		return fmt.Errorf("managedidentity: the IMDS response came from an unexpected server %q", server)
+	}
+	return nil
+}
+
+// imdsErrorResponse is the error shape both IMDS legs use.
+type imdsErrorResponse struct {
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description"`
+}
+
+func (e imdsErrorResponse) String() string {
+	switch {
+	case e.Error != "" && e.ErrorDescription != "":
+		return fmt.Sprintf("%s: %s", e.Error, e.ErrorDescription)
+	case e.Error != "":
+		return e.Error
+	default:
+		return e.ErrorDescription
+	}
+}
+
+// parseIMDSError extracts the error payload IMDS returns on a non-200. The body
+// is best effort: IMDS is not guaranteed to return JSON for every failure.
+func parseIMDSError(body []byte) string {
+	var e imdsErrorResponse
+	if err := json.Unmarshal(body, &e); err == nil {
+		if s := e.String(); s != "" {
+			return s
+		}
+	}
+	return strings.TrimSpace(string(body))
+}
+
+// entraTokenError is a non-200 from the Entra token endpoint on the mTLS leg.
+// The OAuth error code is kept because invalid_client specifically means the
+// binding certificate is no longer acceptable, which is recoverable by minting
+// a new one.
+type entraTokenError struct {
+	StatusCode  int
+	Code        string
+	Description string
+}
+
+func (e *entraTokenError) Error() string {
+	if e.Description != "" {
+		return fmt.Sprintf("managedidentity: the token endpoint returned %d: %s: %s", e.StatusCode, e.Code, e.Description)
+	}
+	if e.Code != "" {
+		return fmt.Sprintf("managedidentity: the token endpoint returned %d: %s", e.StatusCode, e.Code)
+	}
+	return fmt.Sprintf("managedidentity: the token endpoint returned %d", e.StatusCode)
+}
+
+// newEntraTokenError builds an error from an Entra token endpoint failure.
+func newEntraTokenError(statusCode int, body []byte) error {
+	e := &entraTokenError{StatusCode: statusCode}
+	var parsed imdsErrorResponse
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		e.Code = parsed.Error
+		e.Description = parsed.ErrorDescription
+	}
+	if e.Code == "" && e.Description == "" && len(body) > 0 {
+		e.Description = strings.TrimSpace(string(body))
+	}
+	return e
+}
+
+// shouldRemintCertificate reports whether err indicates the binding certificate
+// itself is the problem, rather than the request being wrong.
+//
+// Two things mean the same thing here. Entra answers invalid_client when it no
+// longer accepts the certificate. The TLS stack answers with a connection reset
+// or a handshake failure when the server rejects the client certificate before
+// any HTTP response exists to carry an error code. Both are fixed by minting a
+// new certificate, and neither is fixed by retrying with the same one.
+func shouldRemintCertificate(err error) bool {
+	if err == nil {
+		return false
+	}
+	var tokenErr *entraTokenError
+	if errors.As(err, &tokenErr) {
+		return tokenErr.Code == "invalid_client"
+	}
+	// A failure to verify the server's own chain is deliberately not treated as
+	// re-mintable: our certificate is not the problem, and silently retrying
+	// would obscure an untrusted or intercepted endpoint.
+	if errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	// Windows reports the same condition with its own code rather than ECONNRESET.
+	var errno syscall.Errno
+	if errors.As(err, &errno) && uintptr(errno) == wsaeConnReset {
+		return true
+	}
+	// The handshake alert has no typed representation in crypto/tls, so the
+	// message is the only signal available.
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "tls: bad certificate") ||
+		strings.Contains(msg, "tls: certificate required") ||
+		strings.Contains(msg, "handshake failure")
+}

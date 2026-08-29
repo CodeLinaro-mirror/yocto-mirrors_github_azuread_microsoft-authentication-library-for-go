@@ -135,12 +135,20 @@ stages:
               testRunTitle: "Integration Tests"
 
   # ──────────────────────────────────────────────
-  # Stage 4 — Managed Identity E2E Tests (IMDS v1)
+  # Stage 4 — Managed Identity E2E Tests (IMDS v1 and v2)
   #
   # Runs on the self-hosted "MISEManagedIdentity" VM (Windows), which has a
   # system-assigned managed identity plus the user-assigned managed identities
   # assigned to it and IMDS reachable. These are the SAME identities used by the
   # MSAL .NET IMDS E2E tests, so both SDKs exercise the same lab configuration.
+  #
+  # The -run filter selects both suites:
+  #   TestManagedIdentityImds  — IMDS v1 (bearer tokens)
+  #   TestIMDSv2*              — IMDS v2 (mTLS proof-of-possession, KeyGuard-bound)
+  # The v2 tests skip with an explicit reason when the agent serves IMDSv1 only,
+  # lacks Credential Guard, or has no identity assigned, so they cannot red the
+  # build on an agent that is not provisioned for them. Check the test log for
+  # skips before treating a green run as v2 coverage.
   #
   # Runs on every PR. Go is installed only when the VM does not already have it
   # (checked below) so we don't re-install Go on every run.
@@ -184,7 +192,7 @@ stages:
                 go install gotest.tools/gotestsum
                 Pop-Location
                 $env:PATH = "$env:PATH;$(go env GOPATH)\bin"
-                gotestsum --junitfile "$(Build.SourcesDirectory)\mi-e2e-imds-tests.xml" -- -tags e2e -count=1 -run '^TestManagedIdentityImds$' ./apps/tests/e2e/...
+                gotestsum --junitfile "$(Build.SourcesDirectory)\mi-e2e-imds-tests.xml" -- -tags e2e -count=1 -run '^(TestManagedIdentityImds$|TestIMDSv2)' ./apps/tests/e2e/...
           - task: PublishTestResults@2
             displayName: "Publish MI E2E test results"
             condition: succeededOrFailed()

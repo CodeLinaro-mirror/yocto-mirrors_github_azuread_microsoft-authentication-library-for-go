@@ -23,6 +23,15 @@ linters:
         linters:
           - gosec
         text: "G103"
+      # keyprovider_windows.go has the same shape: it is the CNG/NCrypt syscall
+      # surface for minting a KeyGuard binding key, and passing unsafe.Pointer to
+      # syscall.SyscallN is the only way to call NCrypt at all. Scope the exclusion
+      # to that one file rather than the whole managedidentity package, so G103
+      # still applies to the rest of it. Every other gosec rule still applies here.
+      - path: apps/managedidentity/keyprovider_windows\.go
+        linters:
+          - gosec
+        text: "G103"
       # TODO: temporary suppressions to be addressed separately after the v2 upgrade.
       - linters:
           - gosec

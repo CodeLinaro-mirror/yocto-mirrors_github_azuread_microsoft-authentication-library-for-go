@@ -12,6 +12,7 @@ package managedidentity
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -182,10 +183,19 @@ type Client struct {
 	authParams         authority.AuthParams
 	retryPolicyEnabled bool
 	canRefresh         *atomic.Value
+	mtlsClientFactory  func(cert tls.Certificate) *http.Client
+	// keyProvider overrides how the IMDSv2 binding key is produced. It is only
+	// set by tests; production always uses the platform provider.
+	keyProvider keyProvider
 }
 
 type AcquireTokenOptions struct {
 	claims string
+	// mtlsPoP requests a certificate-bound token.
+	mtlsPoP bool
+	// overMtls requests a bearer token acquired over a mutually authenticated
+	// connection.
+	overMtls bool
 }
 
 type ClientOption func(*Client)
@@ -329,10 +339,27 @@ func (c Client) AcquireToken(ctx context.Context, resource string, options ...Ac
 	for _, option := range options {
 		option(&o)
 	}
+	if err := o.validate(c.source); err != nil {
+		return AuthResult{}, err
+	}
 	c.authParams.Scopes = []string{resource}
 
-	// ignore cached access tokens when given claims
-	if o.claims == "" {
+	// A certificate-bound token is cached under a scheme keyed by the
+	// certificate it is bound to, so the cache can only be consulted once that
+	// certificate is known. When none has been issued yet no bound token can
+	// have been cached either, and reading the cache with the default scheme
+	// would match a bearer token and hand back an unbound credential for a
+	// request that explicitly asked for a bound one.
+	readCache := o.claims == ""
+	if o.mtlsPoP {
+		if binding, ok := certCache.get(cacheKey(c.miType, false)); ok {
+			c.authParams.AuthnScheme = authority.NewMtlsPoPAuthenticationScheme(binding.Leaf)
+		} else {
+			readCache = false
+		}
+	}
+
+	if readCache {
 		stResp, err := cacheManager.Read(ctx, c.authParams)
 		if err != nil {
 			return AuthResult{}, err
@@ -341,7 +368,7 @@ func (c Client) AcquireToken(ctx context.Context, resource string, options ...Ac
 		if err == nil {
 			if !stResp.AccessToken.RefreshOn.T.IsZero() && !stResp.AccessToken.RefreshOn.T.After(now()) && c.canRefresh.CompareAndSwap(false, true) {
 				defer c.canRefresh.Store(false)
-				if tr, er := c.getToken(ctx, resource); er == nil {
+				if tr, er := c.getToken(ctx, resource, o); er == nil {
 					return tr, nil
 				}
 			}
@@ -349,10 +376,16 @@ func (c Client) AcquireToken(ctx context.Context, resource string, options ...Ac
 			return ar, err
 		}
 	}
-	return c.getToken(ctx, resource)
+	return c.getToken(ctx, resource, o)
 }
 
-func (c Client) getToken(ctx context.Context, resource string) (AuthResult, error) {
+func (c Client) getToken(ctx context.Context, resource string, o AcquireTokenOptions) (AuthResult, error) {
+	// The IMDSv2 certificate path replaces the ordinary IMDS request entirely.
+	// There is deliberately no fallback to IMDSv1 here: quietly returning an
+	// unbound token would defeat the protection the caller asked for.
+	if o.usesIMDSv2() {
+		return c.acquireTokenForIMDSv2(ctx, resource, o)
+	}
 	switch c.source {
 	case AzureArc:
 		return c.acquireTokenForAzureArc(ctx, resource)

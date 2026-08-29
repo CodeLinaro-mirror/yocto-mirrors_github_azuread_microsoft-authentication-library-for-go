@@ -398,7 +398,89 @@ Notes:
   goes to `mtlsauth.*`: it needs a tenanted AAD authority on a known `login.*` host, and a
   `WithHTTPClient` value that is not an `*http.Client` still requires `WithMtlsHTTPClient`.
 
-## Community Help and Support
+## Managed identity with mTLS proof-of-possession (IMDSv2)
+
+On an Azure VM whose IMDS endpoint serves the **v2 credential API**, a managed identity can acquire a
+**certificate-bound** token. MSAL mints an RSA key inside **Virtualization-Based Security (KeyGuard)**,
+has IMDS issue a short-lived certificate for it, and exchanges that certificate for the token over
+mutual TLS. The private key never leaves the VBS trustlet, so possession of the token cannot be
+transferred by copying key bytes out of process memory.
+
+```go
+client, err := mi.New(mi.SystemAssigned())
+if err != nil {
+    // TODO: handle error
+}
+
+result, err := client.AcquireToken(context.TODO(), "https://vault.azure.net",
+    mi.WithMtlsProofOfPossession())
+if err != nil {
+    // TODO: handle error
+}
+_ = result.Metadata.TokenType   // "mtls_pop"
+_ = result.BindingCertificate   // the certificate the token is bound to
+```
+
+### Calling the resource
+
+An `mtls_pop` token is only accepted when the same certificate is presented on the TLS handshake.
+Drop `result.BindingCertificate` into the transport and send the token with the `mtls_pop` scheme:
+
+```go
+httpClient := &http.Client{
+    Transport: &http.Transport{
+        TLSClientConfig: &tls.Config{
+            Certificates: []tls.Certificate{*result.BindingCertificate},
+            MinVersion:   tls.VersionTLS12,
+        },
+    },
+}
+
+req, _ := http.NewRequest(http.MethodGet, "https://myvault.vault.azure.net/secrets/s?api-version=7.4", nil)
+req.Header.Set("Authorization", "mtls_pop "+result.AccessToken)
+req.Header.Set("x-ms-tokenboundauth", "true")
+resp, err := httpClient.Do(req)
+```
+
+Sending the token as `Bearer`, or over a connection without the certificate, is rejected by a
+resource that enforces token binding — that is the point of the feature.
+
+### Bearer over mTLS
+
+`WithRequestOverMtls()` performs the same certificate-authenticated exchange but asks for an
+**ordinary bearer token**. Use it when you want the hardened credential path without requiring the
+resource to understand `mtls_pop`; nothing changes for the resource. `result.BindingCertificate` is
+still returned so you can reuse the connection, but the token is not bound to it.
+
+The two options are mutually exclusive; combining them returns `ErrMtlsPoPAndBearerExclusive`.
+
+### Requirements and errors
+
+Both options require Windows with Credential Guard/VBS enabled and a host whose IMDS serves the v2
+credential API. This matches MSAL .NET, which also restricts IMDSv2 to KeyGuard-capable Windows
+hosts. Failures are typed so you can branch on them with `errors.Is`:
+
+| Error | Meaning |
+|---|---|
+| `ErrMtlsNotSupportedForPlatform` | Not Windows — no KeyGuard is available. |
+| `ErrCredentialGuardNotAvailable` | Windows, but VBS/Credential Guard is off, so no isolated key can be minted. |
+| `ErrMtlsPoPNotSupportedInIMDSv1` | The host serves IMDSv1 only. There is **no silent downgrade** to an unbound token. |
+| `ErrMtlsPoPNotSupportedForSource` | The identity source (App Service, Cloud Shell, Azure Arc, …) has no v2 credential endpoint. |
+| `ErrMtlsPoPAndBearerExclusive` | `WithMtlsProofOfPossession()` and `WithRequestOverMtls()` were both set. |
+
+Notes:
+
+- **No fallback by design.** If you ask for a bound token and the host cannot produce one, the call
+  fails rather than returning an unbound token that looks equivalent but is not.
+- **Caching.** Certificates are cached per identity and reused across calls, and bound tokens are
+  cached under a partition keyed by the certificate thumbprint, so a bound token is never served for
+  an unbound request or vice versa. A warm call makes no IMDS round trips.
+- **Custom transport.** `WithMtlsHTTPClient` supplies a factory that builds the `*http.Client` used
+  for the certificate-authenticated leg, for callers who must own the TLS handshake themselves.
+- **All managed identity kinds** are supported: `SystemAssigned()`, and user-assigned by client ID,
+  object ID, or resource ID.
+
+
 
 We use [Stack Overflow](http://stackoverflow.com/questions/tagged/msal) to work with the community on supporting Azure Active Directory and its SDKs, including this one! We highly recommend you ask your questions on Stack Overflow (we're all on there!) Also browse existing issues to see if someone has had your question before. Please use the "msal" tag when asking your questions.
 
