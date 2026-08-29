@@ -223,11 +223,23 @@ stages:
               script: |
                 # A bare TCP reset during the TLS handshake looks the same whether the agent cannot
                 # reach the vault at all or the vault refused what the Go client offered. curl uses a
-                # different TLS stack over the same egress path, so a well-formed HTTP response here
-                # separates the two.
-                $vault = "tokenbindingdemo.vault.azure.net"
-                Test-NetConnection $vault -Port 443 -InformationLevel Detailed
-                curl.exe -sS -v --max-time 30 "https://$vault/secrets/boundsecret?api-version=7.4" 2>&1 | Select-Object -First 60
+                # different TLS stack over the same egress path, and a Key Vault that does not
+                # enforce token binding is the control that separates "this vault" from "any vault",
+                # so between them a reset here can be attributed to something.
+                #
+                # curl writes its trace to stderr, which PowerShell turns into a terminating
+                # NativeCommandError that truncates exactly the output being collected, so both
+                # streams go to files and are read back instead.
+                $ErrorActionPreference = "Continue"
+                foreach ($vaultHost in @("tokenbindingdemo.vault.azure.net", "msidlabs.vault.azure.net")) {
+                  Write-Host "===== $vaultHost ====="
+                  $out = Join-Path $env:TEMP "$vaultHost.out"
+                  $err = Join-Path $env:TEMP "$vaultHost.err"
+                  & $env:ComSpec /c "curl.exe -sS -v --max-time 30 ""https://$vaultHost/secrets/boundsecret?api-version=7.4"" > ""$out"" 2> ""$err"""
+                  Write-Host "-- exit $LASTEXITCODE --"
+                  if (Test-Path $err) { Get-Content $err | Select-Object -First 40 }
+                  if (Test-Path $out) { Get-Content $out | Select-Object -First 10 }
+                }
           - task: PowerShell@2
             displayName: "Run Managed Identity IMDS E2E Tests"
             inputs:
