@@ -6,7 +6,6 @@ package managedidentity
 import (
 	"context"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"sync"
 )
@@ -152,7 +151,7 @@ func (v imdsV2) getBindingCertificate(ctx context.Context, attested bool) (*bind
 		delete(certCache.entries, key)
 	}
 
-	cert, err := v.issueBindingCertificate(ctx, correlationID, metadata)
+	cert, err := v.issueBindingCertificate(ctx, correlationID, metadata, attested)
 	if err != nil {
 		return nil, "", err
 	}
@@ -162,7 +161,7 @@ func (v imdsV2) getBindingCertificate(ctx context.Context, attested bool) (*bind
 
 // issueBindingCertificate mints a key and exchanges a CSR for a certificate.
 // The caller holds the cache lock.
-func (v imdsV2) issueBindingCertificate(ctx context.Context, correlationID string, metadata csrMetadata) (*bindingCertificate, error) {
+func (v imdsV2) issueBindingCertificate(ctx context.Context, correlationID string, metadata csrMetadata, attested bool) (*bindingCertificate, error) {
 	key, err := v.keyProvider.getOrCreateKey(bindingKeyName)
 	if err != nil {
 		return nil, err
@@ -180,16 +179,23 @@ func (v imdsV2) issueBindingCertificate(ctx context.Context, correlationID strin
 		return nil, err
 	}
 
-	// Attestation is attempted whenever the native library is deployed. When it
-	// is absent the request goes out non-attested and the service decides
-	// whether that is acceptable for this resource, which matches how MSAL .NET
-	// behaves without its optional attestation package. A library that is
-	// present but fails is a real error: silently downgrading would turn an MAA
-	// policy denial into a confusing rejection from IMDS instead.
-	attestationToken, err := attestKeyGuard(metadata.AttestationEndpoint, metadata.ClientID, key)
-	if err != nil && !errors.Is(err, errAttestationUnavailable) {
-		_ = key.Close()
-		return nil, err
+	// Attestation is attempted only when the caller opted in with
+	// WithAttestationSupport(), which mirrors MSAL .NET: without its optional
+	// attestation package the provider is unset and the credential request goes
+	// out non-attested.
+	//
+	// Once the caller has opted in, a failure to attest is fatal rather than a
+	// downgrade. Falling back would send a non-attested request on behalf of a
+	// caller who explicitly asked for attestation, turning a missing native
+	// library or an MAA policy denial into a credential that silently carries
+	// fewer guarantees than the one requested.
+	var attestationToken string
+	if attested {
+		attestationToken, err = attestKeyGuardFn(metadata.AttestationEndpoint, metadata.ClientID, key)
+		if err != nil {
+			_ = key.Close()
+			return nil, err
+		}
 	}
 
 	issued, err := v.issueCredential(ctx, correlationID, csr, attestationToken)

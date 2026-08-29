@@ -122,6 +122,9 @@ type imdsFake struct {
 	sawClientCert bool
 	// presentedCert is the leaf the client presented on the last token request.
 	presentedCert *x509.Certificate
+	// lastAttestationToken is the attestation token carried by the most recent
+	// issue request, so a test can tell an attested request from a plain one.
+	lastAttestationToken string
 }
 
 func newIMDSFake(t *testing.T) *imdsFake {
@@ -244,6 +247,7 @@ func (f *imdsFake) handleIssue(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	f.lastAttestationToken = body.AttestationToken
 	der, err := base64.StdEncoding.DecodeString(body.CSR)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -374,6 +378,125 @@ func withCleanCaches(t *testing.T) {
 		cacheManager = storage.New(nil)
 		platformSupportsMtlsPoP = func() bool { return runtime.GOOS == "windows" }
 	})
+}
+
+// withStubAttestation substitutes the attestation provider so a test can drive
+// the attested path on a host that has neither KeyGuard nor the native library.
+// It returns a pointer to the call count so a test can assert that attestation
+// was, or was not, attempted at all.
+func withStubAttestation(t *testing.T, token string, err error) *int {
+	t.Helper()
+	calls := 0
+	original := attestKeyGuardFn
+	attestKeyGuardFn = func(endpoint, clientID string, key bindingKey) (string, error) {
+		calls++
+		return token, err
+	}
+	t.Cleanup(func() { attestKeyGuardFn = original })
+	return &calls
+}
+
+func TestIMDSv2SendsNoAttestationTokenWithoutOptIn(t *testing.T) {
+	withCleanCaches(t)
+	calls := withStubAttestation(t, "stub-attestation-jwt", nil)
+	fake := newIMDSFake(t)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession()); err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+	if *calls != 0 {
+		t.Fatalf("attestation was attempted %d times without WithAttestationSupport", *calls)
+	}
+	if fake.lastAttestationToken != "" {
+		t.Fatalf("attestation token = %q, want empty", fake.lastAttestationToken)
+	}
+}
+
+func TestIMDSv2SendsAttestationTokenWhenOptedIn(t *testing.T) {
+	withCleanCaches(t)
+	calls := withStubAttestation(t, "stub-attestation-jwt", nil)
+	fake := newIMDSFake(t)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+	if *calls != 1 {
+		t.Fatalf("attestation attempted %d times, want 1", *calls)
+	}
+	if fake.lastAttestationToken != "stub-attestation-jwt" {
+		t.Fatalf("attestation token = %q, want stub-attestation-jwt", fake.lastAttestationToken)
+	}
+}
+
+// A caller that asked for attestation is never quietly downgraded: failing to
+// attest has to surface rather than produce a credential without the guarantee
+// the caller requested.
+func TestIMDSv2FailsWhenAttestationUnavailable(t *testing.T) {
+	withCleanCaches(t)
+	withStubAttestation(t, "", errAttestationUnavailable)
+	fake := newIMDSFake(t)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	_, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession(), WithAttestationSupport())
+	if err == nil {
+		t.Fatal("AcquireToken succeeded, so the caller was silently given a non-attested credential")
+	}
+	if !errors.Is(err, errAttestationUnavailable) {
+		t.Fatalf("error = %v, want it to wrap errAttestationUnavailable", err)
+	}
+	for _, call := range fake.calls {
+		if call == "issue" {
+			t.Fatal("a credential request was sent even though attestation failed")
+		}
+	}
+}
+
+// An attested certificate and a plain one are different credentials, so they
+// must not share a cache entry in either direction. MSAL .NET separates them
+// with an #att tag on the certificate cache key for the same reason.
+func TestIMDSv2AttestedAndNonAttestedCertificatesDoNotShareCache(t *testing.T) {
+	bound := []AcquireTokenOption{WithMtlsProofOfPossession()}
+	attested := []AcquireTokenOption{WithMtlsProofOfPossession(), WithAttestationSupport()}
+	for _, tc := range []struct {
+		name       string
+		first      []AcquireTokenOption
+		second     []AcquireTokenOption
+		wantSecond string
+	}{
+		{name: "attested cannot be reused by a plain request", first: attested, second: bound, wantSecond: ""},
+		{name: "plain cannot be reused by an attested request", first: bound, second: attested, wantSecond: "stub-attestation-jwt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withCleanCaches(t)
+			withStubAttestation(t, "stub-attestation-jwt", nil)
+			fake := newIMDSFake(t)
+			client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+			if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", tc.first...); err != nil {
+				t.Fatalf("first AcquireToken: %v", err)
+			}
+			// A different resource misses the token cache, so the certificate
+			// cache alone decides whether a new certificate is issued.
+			fake.resetCalls()
+			if _, err := client.AcquireToken(context.Background(), "https://storage.azure.com", tc.second...); err != nil {
+				t.Fatalf("second AcquireToken: %v", err)
+			}
+			issued := false
+			for _, call := range fake.calls {
+				if call == "issue" {
+					issued = true
+				}
+			}
+			if !issued {
+				t.Fatal("the second request reused the first certificate, so attested and non-attested credentials shared a cache entry")
+			}
+			if fake.lastAttestationToken != tc.wantSecond {
+				t.Fatalf("attestation token on the second request = %q, want %q", fake.lastAttestationToken, tc.wantSecond)
+			}
+		})
+	}
 }
 
 func TestIMDSv2AcquiresBoundTokenInThreeCalls(t *testing.T) {

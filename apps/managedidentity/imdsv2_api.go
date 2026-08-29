@@ -110,7 +110,7 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 		baseEndpoint: imdsV2BaseEndpoint(),
 	}
 
-	binding, key, err := v.getBindingCertificate(ctx, false)
+	binding, key, err := v.getBindingCertificate(ctx, o.attestation)
 	if err != nil {
 		return AuthResult{}, err
 	}
@@ -121,7 +121,7 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 			return AuthResult{}, err
 		}
 		certCache.evict(key)
-		binding, _, err = v.getBindingCertificate(ctx, false)
+		binding, _, err = v.getBindingCertificate(ctx, o.attestation)
 		if err != nil {
 			return AuthResult{}, err
 		}

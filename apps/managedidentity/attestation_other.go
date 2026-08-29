@@ -8,7 +8,7 @@ package managedidentity
 // attestKeyGuard has no non-Windows implementation. KeyGuard is a Windows
 // Virtualization Based Security feature and the native attestation library
 // ships only for Windows, so every other platform reports the capability as
-// absent and the credential request goes out non-attested.
+// absent.
 func attestKeyGuard(endpoint, clientID string, key bindingKey) (string, error) {
 	return "", errAttestationUnavailable
 }

@@ -196,6 +196,9 @@ type AcquireTokenOptions struct {
 	// overMtls requests a bearer token acquired over a mutually authenticated
 	// connection.
 	overMtls bool
+	// attestation requests that the binding key be attested before IMDS issues
+	// a certificate for it.
+	attestation bool
 }
 
 type ClientOption func(*Client)
@@ -207,6 +210,28 @@ type AcquireTokenOption func(o *AcquireTokenOptions)
 func WithClaims(claims string) AcquireTokenOption {
 	return func(o *AcquireTokenOptions) {
 		o.claims = claims
+	}
+}
+
+// WithAttestationSupport requests that the IMDSv2 binding key be attested before
+// IMDS issues a certificate for it, so the issued certificate carries proof that
+// the private key lives in a KeyGuard trustlet. Use it when the resource requires
+// an attested credential.
+//
+// Attestation needs AttestationClientLib.dll, a native Windows component that is
+// distributed separately and is not part of this module. Deploy it alongside the
+// host executable, or anywhere else on the loader search path. It is published in
+// the Microsoft.Azure.Security.KeyGuardAttestation package, under
+// runtimes/win-x64/native.
+//
+// Without this option no attestation is attempted and the credential request goes
+// out non-attested, which mirrors MSAL .NET when its optional
+// Microsoft.Identity.Client.KeyAttestation package is not referenced. With it, a
+// failure to attest is an error rather than a downgrade: a caller that asked for
+// attestation is never silently given a credential that lacks it.
+func WithAttestationSupport() AcquireTokenOption {
+	return func(o *AcquireTokenOptions) {
+		o.attestation = true
 	}
 }
 
@@ -353,7 +378,7 @@ func (c Client) AcquireToken(ctx context.Context, resource string, options ...Ac
 	readCache := o.claims == ""
 	var cachedBinding *bindingCertificate
 	if o.mtlsPoP {
-		if binding, ok := certCache.get(cacheKey(c.miType, false)); ok {
+		if binding, ok := certCache.get(cacheKey(c.miType, o.attestation)); ok {
 			cachedBinding = binding
 			c.authParams.AuthnScheme = authority.NewMtlsPoPAuthenticationScheme(binding.Leaf)
 		} else {

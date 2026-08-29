@@ -170,8 +170,9 @@ func findAttestationLib() (string, error) {
 }
 
 // attestKeyGuard asks the native library for an MAA statement over key. It
-// returns errAttestationUnavailable when the library is not deployed, which the
-// caller treats as "send a non-attested request" rather than as a failure.
+// returns errAttestationUnavailable when the library is not deployed, so the
+// caller can tell an undeployed library apart from a statement the service
+// refused.
 func attestKeyGuard(endpoint, clientID string, key bindingKey) (string, error) {
 	// Only a VBS-isolated key can be attested. MSAL .NET gates on the same
 	// condition and sends a non-attested request for software and TPM keys,
