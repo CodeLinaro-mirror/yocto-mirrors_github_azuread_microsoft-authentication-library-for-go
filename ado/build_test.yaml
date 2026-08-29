@@ -231,14 +231,21 @@ stages:
                 # NativeCommandError that truncates exactly the output being collected, so both
                 # streams go to files and are read back instead.
                 $ErrorActionPreference = "Continue"
+                # Reproduced locally: the reset is triggered by x-ms-tokenboundauth on a connection
+                # with no client certificate, while the same request without that header answers
+                # 401. Sending both variants here says whether the resource behaves the same way
+                # from the agent, and the plain vault says whether it is specific to this one.
                 foreach ($vaultHost in @("tokenbindingdemo.vault.azure.net", "msidlabs.vault.azure.net")) {
-                  Write-Host "===== $vaultHost ====="
-                  $out = Join-Path $env:TEMP "$vaultHost.out"
-                  $err = Join-Path $env:TEMP "$vaultHost.err"
-                  & $env:ComSpec /c "curl.exe -sS -v --max-time 30 ""https://$vaultHost/secrets/boundsecret?api-version=7.4"" > ""$out"" 2> ""$err"""
-                  Write-Host "-- exit $LASTEXITCODE --"
-                  if (Test-Path $err) { Get-Content $err | Select-Object -First 40 }
-                  if (Test-Path $out) { Get-Content $out | Select-Object -First 10 }
+                  foreach ($bound in @($false, $true)) {
+                    Write-Host "===== $vaultHost tokenboundauth=$bound ====="
+                    $tag = "$vaultHost-$bound"
+                    $out = Join-Path $env:TEMP "$tag.out"
+                    $err = Join-Path $env:TEMP "$tag.err"
+                    $hdr = if ($bound) { '-H "x-ms-tokenboundauth: true"' } else { "" }
+                    & $env:ComSpec /c "curl.exe -sS -v --max-time 30 -o ""$out"" -w ""HTTP=%{http_code}\n"" -H ""Authorization: mtls_pop dummy"" $hdr ""https://$vaultHost/secrets/boundsecret?api-version=7.4"" 2> ""$err"""
+                    Write-Host "-- exit $LASTEXITCODE --"
+                    if (Test-Path $err) { Get-Content $err | Select-String -Pattern 'SSL|TLS|subject|issuer|HTTP|error|closed|reset|< ' | Select-Object -First 20 }
+                  }
                 }
           - task: PowerShell@2
             displayName: "Run Managed Identity IMDS E2E Tests"

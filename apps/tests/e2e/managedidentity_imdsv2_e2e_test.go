@@ -336,16 +336,27 @@ func TestIMDSv2BoundTokenIsRejectedWithoutCertificate(t *testing.T) {
 // opts in to token binding with x-ms-tokenboundauth. Passing a zero tls.Certificate omits the
 // client certificate, which is how the negative case is expressed.
 func getBoundSecret(ctx context.Context, url, token string, cert tls.Certificate) (string, int, error) {
+	// Go only offers a client certificate when the server asks for one, and it matches
+	// tls.Config.Certificates against the certificate authorities the server says it accepts,
+	// silently sending nothing when none match. A binding certificate is issued by an internal CA
+	// the resource is not obliged to advertise, so it is selected through this callback, which is
+	// not filtered. Recording whether the callback ran distinguishes "the resource rejected our
+	// certificate" from "the resource never asked for one", which otherwise look identical: both
+	// end as a closed connection with no HTTP response to inspect.
+	var (
+		certRequested bool
+		acceptableCAs int
+	)
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-	if len(cert.Certificate) > 0 {
-		// Go matches tls.Config.Certificates against the certificate authorities the server says
-		// it accepts, and silently sends nothing when none match. A binding certificate is issued
-		// by an internal CA the resource is not obliged to advertise, so selecting it through this
-		// callback is what guarantees it is actually presented rather than dropped, which would be
-		// indistinguishable from the negative case below.
-		tlsConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			return &cert, nil
+	tlsConfig.GetClientCertificate = func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		certRequested = true
+		acceptableCAs = len(cri.AcceptableCAs)
+		if len(cert.Certificate) == 0 {
+			// Returning an empty certificate is how Go expresses "send none", which is the
+			// negative case rather than an error.
+			return &tls.Certificate{}, nil
 		}
+		return &cert, nil
 	}
 	client := &http.Client{
 		Timeout:   30 * time.Second,
@@ -361,7 +372,8 @@ func getBoundSecret(ctx context.Context, url, token string, cert tls.Certificate
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", 0, err
+		return "", 0, fmt.Errorf("%w [the resource asked for a client certificate: %t; acceptable CAs it named: %d; a certificate was supplied to send: %t]",
+			err, certRequested, acceptableCAs, len(cert.Certificate) > 0)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
