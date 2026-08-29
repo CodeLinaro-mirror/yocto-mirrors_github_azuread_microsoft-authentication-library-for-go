@@ -238,6 +238,15 @@ func TestIMDSv2TokenIsServedFromCache(t *testing.T) {
 	if first.AccessToken != second.AccessToken {
 		t.Fatal("the second acquisition did not come from the cache")
 	}
+	// Comparing the two thumbprints alone would also be satisfied by both being empty, which is
+	// exactly what a cached bound token served without its certificate looks like. Requiring a
+	// usable certificate first is what makes the comparison mean anything.
+	if second.BindingCertificate == nil {
+		t.Fatal("the cached bound token carries no binding certificate, so the caller cannot call the resource")
+	}
+	if second.BindingCertificateThumbprint() == "" {
+		t.Fatal("the cached token's binding certificate has no thumbprint")
+	}
 	if second.BindingCertificateThumbprint() != first.BindingCertificateThumbprint() {
 		t.Fatal("the cached token is bound to a different certificate")
 	}

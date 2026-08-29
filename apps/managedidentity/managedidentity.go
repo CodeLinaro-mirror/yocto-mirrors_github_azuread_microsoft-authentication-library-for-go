@@ -351,8 +351,10 @@ func (c Client) AcquireToken(ctx context.Context, resource string, options ...Ac
 	// would match a bearer token and hand back an unbound credential for a
 	// request that explicitly asked for a bound one.
 	readCache := o.claims == ""
+	var cachedBinding *bindingCertificate
 	if o.mtlsPoP {
 		if binding, ok := certCache.get(cacheKey(c.miType, false)); ok {
+			cachedBinding = binding
 			c.authParams.AuthnScheme = authority.NewMtlsPoPAuthenticationScheme(binding.Leaf)
 		} else {
 			readCache = false
@@ -373,7 +375,17 @@ func (c Client) AcquireToken(ctx context.Context, resource string, options ...Ac
 				}
 			}
 			ar.AccessToken, err = c.authParams.AuthnScheme.FormatAccessToken(ar.AccessToken)
-			return ar, err
+			if err != nil {
+				return AuthResult{}, err
+			}
+			// A bound token is only usable by a caller that can also present the
+			// certificate it is bound to, so serving one from the cache without
+			// the certificate hands back a token that every resource rejects.
+			// The scheme lookup above already resolved that certificate.
+			if o.mtlsPoP {
+				ar.BindingCertificate = copyBindingCertificate(cachedBinding)
+			}
+			return ar, nil
 		}
 	}
 	return c.getToken(ctx, resource, o)

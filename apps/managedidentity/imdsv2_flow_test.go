@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/base"
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/base/storage"
 )
 
@@ -455,8 +456,27 @@ func TestIMDSv2ServesTokenFromCacheWithoutNetwork(t *testing.T) {
 	if fake.callCount() != 0 {
 		t.Fatalf("expected no network calls on a cache hit, got %v", fake.calls)
 	}
-	if res.Metadata.TokenSource != 2 && res.AccessToken != "test-access-token" {
-		t.Fatalf("unexpected cached result %+v", res)
+	if res.Metadata.TokenSource != base.TokenSourceCache {
+		t.Fatalf("token source = %v, want the cache", res.Metadata.TokenSource)
+	}
+	if res.AccessToken != "test-access-token" {
+		t.Fatalf("access token = %q", res.AccessToken)
+	}
+	// A cached bound token is only usable alongside the certificate it is bound
+	// to, so serving one without the certificate produces a token every
+	// resource rejects. This is invisible to an acquisition-only assertion,
+	// which is why it is checked on the cache-hit path specifically.
+	if res.BindingCertificate == nil {
+		t.Fatal("the cached bound token carries no binding certificate, so the caller cannot call the resource")
+	}
+	if !fake.presentedCert.Equal(res.BindingCertificate.Leaf) {
+		t.Fatal("the cached token's binding certificate is not the one the token is bound to")
+	}
+	if res.BindingCertificateThumbprint() == "" {
+		t.Fatal("the cached token's binding certificate has no thumbprint")
+	}
+	if len(res.BindingCertificate.Certificate) == 0 || res.BindingCertificate.PrivateKey == nil {
+		t.Fatal("the cached token's binding certificate cannot be used for a handshake")
 	}
 }
 
