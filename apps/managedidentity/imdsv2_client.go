@@ -42,6 +42,9 @@ type imdsV2 struct {
 	baseEndpoint string
 }
 
+// TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
+var debugMetadataBody []byte
+
 // endpoint builds an IMDS URL with the api version and any user-assigned
 // identity selector applied.
 func (v imdsV2) endpoint(path string) (string, error) {
@@ -127,6 +130,7 @@ func (v imdsV2) getCsrMetadata(ctx context.Context, correlationID string) (csrMe
 	if err != nil {
 		return csrMetadata{}, err
 	}
+	debugMetadataBody = body // TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
 
 	var metadata csrMetadata
 	if err := json.Unmarshal(body, &metadata); err != nil {
@@ -170,9 +174,11 @@ func (v imdsV2) issueCredential(ctx context.Context, correlationID, csr string) 
 	}
 	body, err := readIMDSResponse(resp)
 	if err != nil {
-		return certificateRequestResponse{}, err
+		// TEMPORARY DIAGNOSTIC - REVERT BEFORE PR.
+		return certificateRequestResponse{}, fmt.Errorf(
+			"%w\n===IMDSV2-DIAG===\nMETADATA: %s\nREQUEST: %s\nCSR_B64: %s\n===END-DIAG===",
+			err, string(debugMetadataBody), string(payload), csr)
 	}
-
 	var issued certificateRequestResponse
 	if err := json.Unmarshal(body, &issued); err != nil {
 		return certificateRequestResponse{}, fmt.Errorf("managedidentity: parsing the issued credential: %w", err)
