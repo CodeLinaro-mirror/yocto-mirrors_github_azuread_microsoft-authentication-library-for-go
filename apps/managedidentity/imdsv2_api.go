@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/oauth/ops/accesstokens"
@@ -84,27 +83,52 @@ func (o AcquireTokenOptions) usesIMDSv2() bool {
 //
 // Scope and identity alone do not describe these tokens. A bearer token
 // obtained over mTLS is issued under a different policy than one obtained over
-// plain HTTP, and a token acquired under a binding-strength floor was checked
-// against a guarantee a token acquired without one was not. Serving either in
-// place of the other would silently weaken what the caller asked for.
+// plain HTTP; a token bound to an attested key carries a guarantee one bound to
+// an unattested key does not; and a token acquired under a binding-strength
+// floor was checked against a guarantee a token acquired without one was not.
+// Serving any of these in place of another would silently weaken what the
+// caller asked for.
 //
-// The component names are MSAL .NET's, from
+// The component names and their values are MSAL .NET's, from
 // AcquireTokenForManagedIdentityParameterBuilder, so a shared cache written by
 // either library partitions the same way.
 func (o AcquireTokenOptions) stampCacheComponents(params *authority.AuthParams) {
 	if params.CacheKeyComponents == nil {
 		params.CacheKeyComponents = map[string]string{}
 	}
+	// .NET records whether an attestation provider was supplied as "1" or "0".
+	// Go's attestation opt-in is the same statement: WithAttestationSupport is
+	// what makes the credential request carry an attestation token.
+	attested := "0"
+	if o.attestation {
+		attested = "1"
+	}
+	// A proof-of-possession token bound to an attested key is not
+	// interchangeable with one bound to an unattested key, even though both are
+	// bound to a certificate for the same identity and scope.
+	if o.mtlsPoP {
+		params.CacheKeyComponents["mi_att"] = attested
+	} else {
+		delete(params.CacheKeyComponents, "mi_att")
+	}
+	// The mTLS-bearer marker carries the attestation mode as its value rather
+	// than a bare flag. These tokens are ordinary bearer tokens, so the
+	// authentication scheme contributes no key ID to the cache key: without the
+	// mode here, nothing at all would separate an attested acquisition from an
+	// unattested one.
 	if o.overMtls {
-		params.CacheKeyComponents["mtls_bearer"] = "1"
+		params.CacheKeyComponents["mtls_bearer"] = attested
 	} else {
 		delete(params.CacheKeyComponents, "mtls_bearer")
 	}
 	// A floor is only recorded when one was set. Writing a zero would change
 	// the key shape for every caller that never asked for a floor, orphaning
 	// tokens cached before this option existed.
+	//
+	// The value is the strength's name, not its number, because .NET stamps
+	// MtlsBindingStrength.ToString() and a C# enum renders as its member name.
 	if o.minStrength > MtlsBindingStrengthNone {
-		params.CacheKeyComponents["mi_minstrength"] = strconv.Itoa(int(o.minStrength))
+		params.CacheKeyComponents["mi_minstrength"] = o.minStrength.String()
 	} else {
 		delete(params.CacheKeyComponents, "mi_minstrength")
 	}

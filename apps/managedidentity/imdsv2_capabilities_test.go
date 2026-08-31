@@ -274,6 +274,84 @@ func TestCacheComponentsPartitionBearerOverMtls(t *testing.T) {
 	}
 }
 
+// A token bound to an attested key carries a guarantee a token bound to an
+// unattested key does not, so the two must not share an entry.
+//
+// The mTLS-bearer case is the one that has nothing else to fall back on: those
+// are ordinary bearer tokens, so the authentication scheme contributes no key
+// ID and the cache key components are the only thing separating them. The PoP
+// case is additionally separated by the binding certificate's thumbprint, but
+// it is partitioned here too because MSAL .NET stamps mi_att and a cache shared
+// between the two libraries has to agree on the key.
+func TestCacheComponentsPartitionByAttestation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts AcquireTokenOptions
+	}{
+		{"mtls-bearer", AcquireTokenOptions{overMtls: true}},
+		{"mtls-pop", AcquireTokenOptions{mtlsPoP: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			off := authParamsForTest()
+			tc.opts.stampCacheComponents(&off)
+
+			attested := tc.opts
+			attested.attestation = true
+			on := authParamsForTest()
+			attested.stampCacheComponents(&on)
+
+			if off.CacheExtKeyGenerator() == on.CacheExtKeyGenerator() {
+				t.Fatal("an attested token shares a cache entry with an unattested one, " +
+					"so a caller who asked for attestation can be served a token minted without it")
+			}
+		})
+	}
+}
+
+// The component values are MSAL .NET's, so a cache shared with .NET partitions
+// the same way. Pinning them keeps a refactor from silently diverging: the two
+// libraries would still each partition correctly, but they would stop agreeing.
+func TestCacheComponentValuesMatchDotNet(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts AcquireTokenOptions
+		want map[string]string
+	}{
+		{"pop unattested", AcquireTokenOptions{mtlsPoP: true}, map[string]string{"mi_att": "0"}},
+		{"pop attested", AcquireTokenOptions{mtlsPoP: true, attestation: true}, map[string]string{"mi_att": "1"}},
+		{"bearer unattested", AcquireTokenOptions{overMtls: true}, map[string]string{"mtls_bearer": "0"}},
+		{"bearer attested", AcquireTokenOptions{overMtls: true, attestation: true}, map[string]string{"mtls_bearer": "1"}},
+		{
+			// .NET stamps MtlsBindingStrength.ToString(), and a C# enum renders
+			// as its member name, so this is "KeyGuard" and not "3".
+			name: "floor is named, not numbered",
+			opts: AcquireTokenOptions{mtlsPoP: true, minStrength: MtlsBindingStrengthKeyGuard},
+			want: map[string]string{"mi_att": "0", "mi_minstrength": "KeyGuard"},
+		},
+		{
+			name: "software floor",
+			opts: AcquireTokenOptions{mtlsPoP: true, minStrength: MtlsBindingStrengthSoftware},
+			want: map[string]string{"mi_att": "0", "mi_minstrength": "Software"},
+		},
+		// A plain request has to keep the key shape it had before any of these
+		// options existed, or every token cached by an earlier version is lost.
+		{"plain", AcquireTokenOptions{}, map[string]string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			params := authParamsForTest()
+			tc.opts.stampCacheComponents(&params)
+			if len(params.CacheKeyComponents) != len(tc.want) {
+				t.Fatalf("components = %v, want %v", params.CacheKeyComponents, tc.want)
+			}
+			for k, want := range tc.want {
+				if got := params.CacheKeyComponents[k]; got != want {
+					t.Errorf("component %q = %q, want %q", k, got, want)
+				}
+			}
+		})
+	}
+}
+
 // Stamping runs on every acquisition against the same params, so an option that
 // is no longer set has to be removed rather than left behind.
 func TestCacheComponentsClearedWhenOptionsDropped(t *testing.T) {
