@@ -17,6 +17,18 @@ type certCacheEntry struct {
 	cert *bindingCertificate
 }
 
+// mintGate serializes issuance for one identity. It is a channel rather than a
+// mutex because a caller waiting for it has to stay cancellable: minting makes
+// two network calls, so a caller whose context expires while queued behind
+// another must be able to give up.
+type mintGate struct {
+	ch chan struct{}
+	// waiters counts everyone holding or queued for the gate, so it can be
+	// dropped from the map once the last one is done rather than accumulating
+	// an entry per identity the process ever used.
+	waiters int
+}
+
 // bindingCertCache caches issued binding certificates for the lifetime of the
 // process. IMDS rate limits credential issuance, and a certificate is valid for
 // far longer than a single token, so re-issuing per token request would be both
@@ -28,9 +40,31 @@ type certCacheEntry struct {
 type bindingCertCache struct {
 	mu      sync.Mutex
 	entries map[string]*certCacheEntry
+	// gates hold minting to one caller per identity. Two different identities
+	// do not block each other, which a single lock around issuance would make
+	// them do: minting is two network round trips, so an unrelated identity
+	// would wait out both. MSAL .NET keys its gates the same way, with
+	// KeyedSemaphorePool in MtlsCertificateCache.
+	gates map[string]*mintGate
+	// forceMint marks identities whose certificate the service rejected. It is
+	// what stops the caches from answering between the eviction and the next
+	// mint: without it a reader that already passed the eviction point could
+	// put the rejected certificate back, or read it again from the store.
+	// MSAL .NET keeps the same flag, as MtlsBindingCache._forceMint.
+	forceMint map[string]struct{}
+	persisted persistentCertCache
 }
 
-var certCache = &bindingCertCache{entries: map[string]*certCacheEntry{}}
+var certCache = newBindingCertCache()
+
+func newBindingCertCache() *bindingCertCache {
+	return &bindingCertCache{
+		entries:   map[string]*certCacheEntry{},
+		gates:     map[string]*mintGate{},
+		forceMint: map[string]struct{}{},
+		persisted: newPersistentCertCache(),
+	}
+}
 
 // cacheKey identifies a binding certificate by the identity the client was
 // configured for and whether it was attested.
@@ -53,28 +87,42 @@ func cacheKey(id ID, attested bool) string {
 	return identityKey(id) + "#att=" + att
 }
 
-// identityKey renders the configured managed identity as a stable string. The
-// kind is included because the same string can be a client ID for one client
-// and an object ID for another, and those are different identities.
+// identityKey renders the configured managed identity as a stable string.
+//
+// This is also the alias a persisted certificate is filed under, so it is the
+// value MSAL .NET uses rather than one of this library's choosing: the two
+// write the same name into the same store, which is what lets either of them
+// reuse a certificate the other issued. MSAL .NET takes the configured
+// identity verbatim, and names the system-assigned identity with the constant
+// reproduced here.
+//
+// A client ID and an object ID are both GUIDs, so two clients configured with
+// the same string but different kinds share an alias. That is safe because the
+// reported client ID is compared against the certificate before it is reused,
+// and a mismatch mints a new one.
 func identityKey(id ID) string {
 	switch t := id.(type) {
 	case UserAssignedClientID:
-		return "client:" + string(t)
+		return string(t)
 	case UserAssignedObjectID:
-		return "object:" + string(t)
+		return string(t)
 	case UserAssignedResourceID:
-		return "resource:" + string(t)
+		return string(t)
 	default:
-		return "system"
+		// Constants.ManagedIdentityDefaultClientId in MSAL .NET.
+		return "system_assigned_managed_identity"
 	}
 }
 
-// get returns a cached certificate if one is present and still usable. The
-// returned certificate carries a reference the caller must release with Close,
-// so that a concurrent evict cannot release the key while it is in use.
+// get returns a cached certificate if one is present. The returned certificate
+// carries a reference the caller must release with Close, so that a concurrent
+// evict cannot release the key while it is in use.
 func (c *bindingCertCache) get(key string) (*bindingCertificate, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if _, forced := c.forceMint[key]; forced {
+		return nil, false
+	}
 	entry, ok := c.entries[key]
 	if !ok {
 		return nil, false
@@ -83,11 +131,27 @@ func (c *bindingCertCache) get(key string) (*bindingCertificate, bool) {
 	return entry.cert, true
 }
 
-// evict drops a certificate and releases its key handle.
+// evict drops a certificate from every cache and marks the identity so nothing
+// can serve the evicted certificate again before a new one is minted.
 func (c *bindingCertCache) evict(key string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.forceMint[key] = struct{}{}
 	if entry, ok := c.entries[key]; ok {
+		_ = entry.cert.Close()
+		delete(c.entries, key)
+	}
+	persisted := c.persisted
+	c.mu.Unlock()
+	persisted.deleteAll(key)
+}
+
+// dropEntry removes cert from the cache, but only if it is still the entry
+// stored under key. A concurrent mint may already have replaced it, and
+// dropping the replacement would throw away a certificate that is fine.
+func (c *bindingCertCache) dropEntry(key string, cert *bindingCertificate) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok && entry.cert == cert {
 		_ = entry.cert.Close()
 		delete(c.entries, key)
 	}
@@ -102,6 +166,134 @@ func (c *bindingCertCache) clear() {
 		_ = entry.cert.Close()
 		delete(c.entries, key)
 	}
+	for key := range c.forceMint {
+		delete(c.forceMint, key)
+	}
+}
+
+// enter blocks until this caller is the only one minting for key.
+func (c *bindingCertCache) enter(ctx context.Context, key string) error {
+	c.mu.Lock()
+	gate, ok := c.gates[key]
+	if !ok {
+		gate = &mintGate{ch: make(chan struct{}, 1)}
+		c.gates[key] = gate
+	}
+	gate.waiters++
+	c.mu.Unlock()
+
+	select {
+	case gate.ch <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		c.releaseWaiter(key)
+		return ctx.Err()
+	}
+}
+
+// leave releases the gate taken by enter.
+func (c *bindingCertCache) leave(key string) {
+	c.mu.Lock()
+	gate, ok := c.gates[key]
+	c.mu.Unlock()
+	if !ok {
+		return
+	}
+	<-gate.ch
+	c.releaseWaiter(key)
+}
+
+func (c *bindingCertCache) releaseWaiter(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if gate, ok := c.gates[key]; ok {
+		gate.waiters--
+		if gate.waiters <= 0 {
+			delete(c.gates, key)
+		}
+	}
+}
+
+// usable returns a cached certificate that is still fit to bind a token to.
+//
+// The validity checks run outside the lock because the orphan check talks to
+// the key provider, and holding the cache lock across an operating system call
+// would serialize every identity behind it.
+func (c *bindingCertCache) usable(key, clientID string, provider keyProvider) (*bindingCertificate, bool) {
+	cert, ok := c.get(key)
+	if !ok {
+		return nil, false
+	}
+	if cert.ClientID == clientID && !needsRefresh(cert) && !isOrphaned(cert, provider) {
+		return cert, true
+	}
+	c.dropEntry(key, cert)
+	_ = cert.Close()
+	return nil, false
+}
+
+// restore promotes a certificate from the operating system store into memory.
+//
+// The store holds the certificate but not the key: the key lives in a CNG
+// container under a fixed name, so it is reopened here and paired with the
+// certificate through the same public key comparison a freshly issued
+// certificate goes through. A certificate that fails that comparison outlived
+// the key it was issued for, which is what a reboot does to a per-boot VBS key,
+// so the whole alias is cleared rather than left to fail again next time.
+func (c *bindingCertCache) restore(key, clientID string, provider keyProvider) (*bindingCertificate, bool) {
+	c.mu.Lock()
+	_, forced := c.forceMint[key]
+	persisted := c.persisted
+	c.mu.Unlock()
+	if forced {
+		return nil, false
+	}
+
+	stored, ok := persisted.read(key)
+	if !ok {
+		return nil, false
+	}
+	// A certificate issued to a different identity than the one IMDS now
+	// reports is not this machine's credential any more.
+	if stored.ClientID != clientID {
+		persisted.deleteAll(key)
+		return nil, false
+	}
+
+	bound, err := provider.getOrCreateKey(bindingKeyName)
+	if err != nil {
+		return nil, false
+	}
+	if err := requireKeyGuard(bound); err != nil {
+		_ = bound.Close()
+		return nil, false
+	}
+	if err := certificateMatchesKey(stored.Leaf, bound); err != nil {
+		_ = bound.Close()
+		persisted.deleteAll(key)
+		return nil, false
+	}
+
+	cert := newBindingCertificate(stored.DER, stored.Leaf, bound, certificateRequestResponse{
+		ClientID:                   stored.ClientID,
+		TenantID:                   stored.TenantID,
+		MtlsAuthenticationEndpoint: stored.Endpoint,
+	})
+	c.adopt(key, cert)
+	return cert, true
+}
+
+// adopt stores cert under key and returns with the caller still holding a
+// reference of its own.
+func (c *bindingCertCache) adopt(key string, cert *bindingCertificate) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.entries[key]; ok {
+		_ = existing.cert.Close()
+	}
+	c.entries[key] = &certCacheEntry{cert: cert}
+	cert.retain()
+	delete(c.forceMint, key)
 }
 
 // isOrphaned reports whether a cached certificate no longer matches the key
@@ -168,22 +360,27 @@ func (v imdsV2) getBindingCertificate(ctx context.Context, attested bool) (*bind
 		return nil, "", err
 	}
 
-	// The lock is held across issuance so that concurrent callers do not each
-	// mint a key into the same container and invalidate each other's
-	// certificate.
-	certCache.mu.Lock()
-	defer certCache.mu.Unlock()
+	if cert, ok := certCache.usable(key, metadata.ClientID, v.keyProvider); ok {
+		return cert, key, nil
+	}
 
-	if entry, ok := certCache.entries[key]; ok {
-		reusable := entry.cert.ClientID == metadata.ClientID &&
-			!needsRefresh(entry.cert) &&
-			!isOrphaned(entry.cert, v.keyProvider)
-		if reusable {
-			entry.cert.retain()
-			return entry.cert, key, nil
-		}
-		_ = entry.cert.Close()
-		delete(certCache.entries, key)
+	// Past this point a certificate is going to be issued unless another caller
+	// is already doing it, so the rest runs one caller at a time per identity.
+	if err := certCache.enter(ctx, key); err != nil {
+		return nil, "", err
+	}
+	defer certCache.leave(key)
+
+	// Whoever held the gate may have minted the certificate this caller wanted.
+	if cert, ok := certCache.usable(key, metadata.ClientID, v.keyProvider); ok {
+		return cert, key, nil
+	}
+
+	// A previous run of this or any other MSAL on the machine may have left a
+	// usable certificate behind, which is worth far more than a round trip: it
+	// is what keeps a restarting fleet from being throttled by IMDS.
+	if cert, ok := certCache.restore(key, metadata.ClientID, v.keyProvider); ok {
+		return cert, key, nil
 	}
 
 	cert, err := v.issueBindingCertificate(ctx, correlationID, metadata, attested)
@@ -199,9 +396,19 @@ func (v imdsV2) getBindingCertificate(ctx context.Context, attested bool) (*bind
 	}
 	// The cache takes over the reference newBindingCertificate created; the
 	// caller gets one of its own.
-	certCache.entries[key] = &certCacheEntry{cert: cert}
-	cert.retain()
+	certCache.adopt(key, cert)
+	certCache.persist(key, cert)
 	return cert, key, nil
+}
+
+// persist writes a newly issued certificate to the operating system store so a
+// restart can reuse it. Failure is not reported: the certificate is already
+// usable, and persistence only saves a future round trip.
+func (c *bindingCertCache) persist(key string, cert *bindingCertificate) {
+	c.mu.Lock()
+	persisted := c.persisted
+	c.mu.Unlock()
+	persisted.write(key, cert)
 }
 
 // issueBindingCertificate mints a key and exchanges a CSR for a certificate.

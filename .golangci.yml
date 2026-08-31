@@ -40,6 +40,16 @@ linters:
         linters:
           - gosec
         text: "G103"
+      # imdsv2_persist_windows.go is the same case again: it is the crypt32
+      # certificate-store surface, and the two property calls it needs are not
+      # in x/sys, so they are invoked through syscall.SyscallN with
+      # unsafe.Pointer arguments. Scoped to this one file so G103 still applies
+      # to the rest of the package, and every other gosec rule still applies
+      # here.
+      - path: apps/managedidentity/imdsv2_persist_windows\.go
+        linters:
+          - gosec
+        text: "G103"
       # TODO: temporary suppressions to be addressed separately after the v2 upgrade.
       - linters:
           - gosec

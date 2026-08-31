@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/oauth/ops/accesstokens"
@@ -78,6 +79,37 @@ func (o AcquireTokenOptions) usesIMDSv2() bool {
 	return o.mtlsPoP || o.overMtls
 }
 
+// stampCacheComponents records the options that change what a token is, so two
+// requests that differ in them do not share a cache entry.
+//
+// Scope and identity alone do not describe these tokens. A bearer token
+// obtained over mTLS is issued under a different policy than one obtained over
+// plain HTTP, and a token acquired under a binding-strength floor was checked
+// against a guarantee a token acquired without one was not. Serving either in
+// place of the other would silently weaken what the caller asked for.
+//
+// The component names are MSAL .NET's, from
+// AcquireTokenForManagedIdentityParameterBuilder, so a shared cache written by
+// either library partitions the same way.
+func (o AcquireTokenOptions) stampCacheComponents(params *authority.AuthParams) {
+	if params.CacheKeyComponents == nil {
+		params.CacheKeyComponents = map[string]string{}
+	}
+	if o.overMtls {
+		params.CacheKeyComponents["mtls_bearer"] = "1"
+	} else {
+		delete(params.CacheKeyComponents, "mtls_bearer")
+	}
+	// A floor is only recorded when one was set. Writing a zero would change
+	// the key shape for every caller that never asked for a floor, orphaning
+	// tokens cached before this option existed.
+	if o.minStrength > MtlsBindingStrengthNone {
+		params.CacheKeyComponents["mi_minstrength"] = strconv.Itoa(int(o.minStrength))
+	} else {
+		delete(params.CacheKeyComponents, "mi_minstrength")
+	}
+}
+
 // validate rejects option combinations that cannot be satisfied.
 func (o AcquireTokenOptions) validate(source Source) error {
 	if o.mtlsPoP && o.overMtls {
@@ -90,6 +122,13 @@ func (o AcquireTokenOptions) validate(source Source) error {
 		// protection the caller asked for.
 		if o.attestation {
 			return ErrAttestationRequiresMtls
+		}
+		// A binding-strength floor is a statement about the key a token is
+		// bound to. A request that binds no key cannot meet it, and accepting
+		// the option silently would hand back a bearer token to a caller who
+		// asked for a guarantee about binding.
+		if o.minStrength > MtlsBindingStrengthNone {
+			return ErrMinStrengthRequiresMtls
 		}
 		return nil
 	}
@@ -113,6 +152,12 @@ func (o AcquireTokenOptions) validate(source Source) error {
 // certificate, and retrying further would turn a misconfiguration into a loop
 // against a rate-limited service.
 func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o AcquireTokenOptions) (AuthResult, error) {
+	// The floor is checked before anything is minted. Discovering afterwards
+	// that the host cannot meet it would mean IMDS had already issued a
+	// credential the caller was always going to refuse.
+	if err := c.enforceMinStrength(ctx, o.minStrength); err != nil {
+		return AuthResult{}, err
+	}
 	v := imdsV2{
 		httpClient:   c.httpClient,
 		keyProvider:  c.bindingKeyProvider(),

@@ -128,7 +128,7 @@ func TestIMDSv2AttestationIsAcceptedWithBearerOverMtls(t *testing.T) {
 	if *attempts != 1 {
 		t.Fatalf("attestation attempts = %d, want 1", *attempts)
 	}
-	if fake.lastAttestationToken == "" {
+	if fake.attestationToken() == "" {
 		t.Fatal("the issue request carried no attestation token")
 	}
 }

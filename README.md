@@ -499,6 +499,62 @@ is never silently given a credential that lacks it.
 Attested and non-attested certificates are cached separately, so opting in never reuses a
 certificate that was issued without attestation.
 
+### Binding strength and host capabilities
+
+`Client.Capabilities` reports what the host's IMDS can do, without minting anything:
+
+```go
+caps, err := client.Capabilities(ctx)
+if err == nil && caps.IsMtlsPoPSupportedByHost() {
+    // the host serves the v2 credential API
+}
+_ = caps.MaxSupportedBindingStrength // None, Software, or KeyGuard
+```
+
+The result is discovered once per process and cached, so a credential chain can probe it cheaply
+before deciding whether to attempt managed identity at all.
+
+`MtlsBindingStrength` describes how well the host can protect a binding key:
+
+| Value | Meaning |
+|---|---|
+| `MtlsBindingStrengthNone` | The host does not serve the v2 credential API. |
+| `MtlsBindingStrengthSoftware` | The host speaks the protocol, but the key would not be VBS-isolated. |
+| `MtlsBindingStrengthKeyGuard` | The key is isolated in a KeyGuard trustlet. |
+
+`WithMtlsPoPMinStrength` sets a floor. The acquisition fails with `ErrMinStrengthNotMet` rather than
+binding to a weaker key than you asked for:
+
+```go
+result, err := client.AcquireToken(ctx, scope,
+    managedidentity.WithMtlsProofOfPossession(),
+    managedidentity.WithMtlsPoPMinStrength(managedidentity.MtlsBindingStrengthKeyGuard),
+)
+```
+
+The floor participates in the token cache key, so a token acquired under a lower floor is never
+served to a caller that demanded a higher one.
+
+Note that msal-go's IMDSv2 flow requires KeyGuard regardless of the floor, so a host reporting
+`MtlsBindingStrengthSoftware` is telling you it speaks the protocol, not that this library will bind
+to its key. The value is reported faithfully so that it matches MSAL .NET, which does fall back to
+weaker key storage.
+
+### Refreshing
+
+`WithForceRefresh` skips the token cache and goes to the STS:
+
+```go
+result, err := client.AcquireToken(ctx, scope,
+    managedidentity.WithMtlsProofOfPossession(),
+    managedidentity.WithForceRefresh(),
+)
+```
+
+It deliberately does **not** re-mint the binding certificate. The certificate identifies the machine
+and is unaffected by a token going stale, and re-minting on every forced call would be throttled by
+IMDS.
+
 ### Requirements and errors
 
 Both options require Windows with Credential Guard/VBS enabled and a host whose IMDS serves the v2
@@ -514,6 +570,8 @@ hosts. Failures are typed so you can branch on them with `errors.Is`:
 | `ErrMtlsPoPAndBearerExclusive` | `WithMtlsProofOfPossession()` and `WithRequestOverMtls()` were both set. |
 | `ErrAttestationRequiresMtls` | `WithAttestationSupport()` was set without one of the two mTLS options, where it would have no effect. |
 | `ErrAttestationUnavailable` | Attestation was requested but `AttestationClientLib.dll` could not be loaded. |
+| `ErrMinStrengthNotMet` | The host's binding strength is below the floor set by `WithMtlsPoPMinStrength()`. |
+| `ErrMinStrengthRequiresMtls` | `WithMtlsPoPMinStrength()` was set without one of the two mTLS options, where it would have no effect. |
 
 Notes:
 
@@ -522,6 +580,16 @@ Notes:
 - **Caching.** Certificates are cached per identity and reused across calls, and bound tokens are
   cached under a partition keyed by the certificate thumbprint, so a bound token is never served for
   an unbound request or vice versa. A warm call makes no IMDS round trips.
+- **Persistent certificate cache (Windows).** The issued certificate is also written to the
+  `CurrentUser\My` certificate store, so a certificate survives process restarts instead of costing
+  two IMDS round trips on every cold start. Only the certificate is stored — the private key stays
+  in its CNG container and is never exported. The store is shared with MSAL .NET, which uses the same
+  key container and naming scheme, so both libraries on one machine reuse one certificate. A reboot
+  replaces the VBS key and orphans the stored certificates, which are detected and cleaned up on the
+  next read. Set `MSAL_MI_DISABLE_PERSISTENT_CERT_CACHE=1` to keep everything in memory.
+- **Concurrency.** Concurrent acquisitions for the same identity mint one certificate, not one each;
+  the caller that arrives second waits for the first and is still cancellable through its context.
+  Different identities proceed in parallel.
 - **Custom transport.** `WithMtlsHTTPClient` supplies a factory that builds the `*http.Client` used
   for the certificate-authenticated leg, for callers who must own the TLS handshake themselves.
 - **All managed identity kinds** are supported: `SystemAssigned()`, and user-assigned by client ID,

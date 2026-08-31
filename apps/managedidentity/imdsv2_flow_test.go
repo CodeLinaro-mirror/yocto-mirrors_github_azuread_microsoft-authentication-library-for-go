@@ -210,10 +210,31 @@ func (f *imdsFake) callCount() int {
 	return len(f.calls)
 }
 
+// countOf reports how many times one endpoint was called, which is how a test
+// distinguishes a cache hit from a re-issue without counting the round trips
+// that happen either way.
+func (f *imdsFake) countOf(path string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, call := range f.calls {
+		if call == path {
+			n++
+		}
+	}
+	return n
+}
+
 func (f *imdsFake) resetCalls() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = nil
+}
+
+func (f *imdsFake) attestationToken() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastAttestationToken
 }
 
 func (f *imdsFake) writeServerHeader(w http.ResponseWriter) {
@@ -268,13 +289,20 @@ func (f *imdsFake) handleMetadata(w http.ResponseWriter, r *http.Request) {
 func (f *imdsFake) handleIssue(w http.ResponseWriter, r *http.Request) {
 	f.record("issue")
 	f.writeServerHeader(w)
+	// Two identities can now mint concurrently, so the fake's mutable state is
+	// guarded. The lock is not held across signing so the handlers still
+	// overlap, which is what the concurrency tests are asserting.
+	f.mu.Lock()
 	if f.issueFailures > 0 {
 		f.issueFailures--
+		f.mu.Unlock()
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	if f.issueStatus != http.StatusOK {
-		w.WriteHeader(f.issueStatus)
+	status := f.issueStatus
+	f.mu.Unlock()
+	if status != http.StatusOK {
+		w.WriteHeader(status)
 		_, _ = w.Write([]byte(`{"error":"bad_request","error_description":"nope"}`))
 		return
 	}
@@ -283,7 +311,9 @@ func (f *imdsFake) handleIssue(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	f.mu.Lock()
 	f.lastAttestationToken = body.AttestationToken
+	f.mu.Unlock()
 	der, err := base64.StdEncoding.DecodeString(body.CSR)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -404,13 +434,19 @@ func (f *imdsFake) newTestClient(t *testing.T, id ID, provider keyProvider, opts
 
 // withCleanCaches isolates a test from certificates and tokens another test
 // cached, since both caches are process-wide.
-func withCleanCaches(t *testing.T) {
+func withCleanCaches(t *testing.T) *fakePersistentCertCache {
 	t.Helper()
 	certCache.clear()
 	clearAttestationCache()
 	clearMtlsClientCache()
+	clearCapabilitiesCache()
 	cacheManager = storage.New(nil)
 	platformSupportsMtlsPoP = func() bool { return true }
+	// The real persistent cache is the user's own certificate store. A test
+	// must not write to it, and must not read a certificate an earlier run left
+	// in it, so it is replaced for the duration.
+	persisted := newFakePersistentCertCache()
+	realPersisted := swapPersistentCache(persisted)
 	// The retry schedule is real time. Tests that exercise a retriable status
 	// would otherwise wait out the backoff, so the wait is recorded rather than
 	// served. A test that cares about the schedule installs its own.
@@ -420,10 +456,13 @@ func withCleanCaches(t *testing.T) {
 		certCache.clear()
 		clearAttestationCache()
 		clearMtlsClientCache()
+		clearCapabilitiesCache()
 		cacheManager = storage.New(nil)
 		platformSupportsMtlsPoP = func() bool { return runtime.GOOS == "windows" }
 		retryWait = realWait
+		swapPersistentCache(realPersisted)
 	})
+	return persisted
 }
 
 // withStubAttestation substitutes the attestation provider so a test can drive
@@ -454,8 +493,8 @@ func TestIMDSv2SendsNoAttestationTokenWithoutOptIn(t *testing.T) {
 	if *calls != 0 {
 		t.Fatalf("attestation was attempted %d times without WithAttestationSupport", *calls)
 	}
-	if fake.lastAttestationToken != "" {
-		t.Fatalf("attestation token = %q, want empty", fake.lastAttestationToken)
+	if fake.attestationToken() != "" {
+		t.Fatalf("attestation token = %q, want empty", fake.attestationToken())
 	}
 }
 
@@ -471,8 +510,8 @@ func TestIMDSv2SendsAttestationTokenWhenOptedIn(t *testing.T) {
 	if *calls != 1 {
 		t.Fatalf("attestation attempted %d times, want 1", *calls)
 	}
-	if fake.lastAttestationToken != "stub-attestation-jwt" {
-		t.Fatalf("attestation token = %q, want stub-attestation-jwt", fake.lastAttestationToken)
+	if fake.attestationToken() != "stub-attestation-jwt" {
+		t.Fatalf("attestation token = %q, want stub-attestation-jwt", fake.attestationToken())
 	}
 }
 
@@ -538,8 +577,8 @@ func TestIMDSv2AttestedAndNonAttestedCertificatesDoNotShareCache(t *testing.T) {
 			if !issued {
 				t.Fatal("the second request reused the first certificate, so attested and non-attested credentials shared a cache entry")
 			}
-			if fake.lastAttestationToken != tc.wantSecond {
-				t.Fatalf("attestation token on the second request = %q, want %q", fake.lastAttestationToken, tc.wantSecond)
+			if fake.attestationToken() != tc.wantSecond {
+				t.Fatalf("attestation token on the second request = %q, want %q", fake.attestationToken(), tc.wantSecond)
 			}
 		})
 	}
@@ -601,15 +640,15 @@ func TestIMDSv2ReusesAttestationTokenForTheSameKey(t *testing.T) {
 	if *calls != 1 {
 		t.Fatalf("attested %d times, want 1: the second certificate should have reused the cached statement", *calls)
 	}
-	if fake.lastAttestationToken != token {
-		t.Fatalf("the second request sent %q, want the cached statement", fake.lastAttestationToken)
+	if fake.attestationToken() != token {
+		t.Fatalf("the second request sent %q, want the cached statement", fake.attestationToken())
 	}
 }
 
 // A statement close enough to its expiry could lapse before the service reads
 // it, so the cache stops serving it before it actually expires.
 func TestIMDSv2ReattestsWhenTheAttestationTokenNearsExpiry(t *testing.T) {
-	withCleanCaches(t)
+	persisted := withCleanCaches(t)
 	realNow := now
 	base := realNow()
 	current := base
@@ -632,6 +671,7 @@ func TestIMDSv2ReattestsWhenTheAttestationTokenNearsExpiry(t *testing.T) {
 	// five-minute buffer.
 	current = base.Add(6 * time.Minute)
 	certCache.clear()
+	persisted.reset()
 	if _, err := client.AcquireToken(context.Background(), "https://storage.azure.com", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
 		t.Fatalf("second AcquireToken: %v", err)
 	}
@@ -669,7 +709,7 @@ func TestIMDSv2ReattestsWhenTheBindingKeyChanges(t *testing.T) {
 // A statement with no readable lifetime is still usable, but there is no basis
 // for deciding when to stop trusting it, so it is not stored.
 func TestIMDSv2DoesNotCacheAttestationTokenWithoutExpiry(t *testing.T) {
-	withCleanCaches(t)
+	persisted := withCleanCaches(t)
 	calls := withCountedAttestation(t, func() string { return "not-a-jwt" })
 	fake := newIMDSFake(t)
 	provider := newFakeKeyProvider()
@@ -678,10 +718,11 @@ func TestIMDSv2DoesNotCacheAttestationTokenWithoutExpiry(t *testing.T) {
 	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
 		t.Fatalf("first AcquireToken: %v", err)
 	}
-	if fake.lastAttestationToken != "not-a-jwt" {
-		t.Fatalf("attestation token = %q, want it sent even though it is not cacheable", fake.lastAttestationToken)
+	if fake.attestationToken() != "not-a-jwt" {
+		t.Fatalf("attestation token = %q, want it sent even though it is not cacheable", fake.attestationToken())
 	}
 	certCache.clear()
+	persisted.reset()
 	if _, err := client.AcquireToken(context.Background(), "https://storage.azure.com", WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
 		t.Fatalf("second AcquireToken: %v", err)
 	}

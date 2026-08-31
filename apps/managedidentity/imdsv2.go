@@ -286,10 +286,32 @@ func shouldRemintCertificate(err error) bool {
 	if errors.As(err, &errno) && uintptr(errno) == wsaeConnReset {
 		return true
 	}
-	// The handshake alert has no typed representation in crypto/tls, so the
-	// message is the only signal available.
+	return isCertificateAlert(err)
+}
+
+// certificateAlertText reports whether the error message describes a TLS alert
+// that names the client certificate as the reason the handshake failed.
+//
+// This is the fallback for toolchains that predate the typed alert; see
+// isCertificateAlert. It is deliberately kept next to the typed implementation
+// so the two sets of alerts stay in step.
+func certificateAlertText(err error) bool {
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "tls: bad certificate") ||
-		strings.Contains(msg, "tls: certificate required") ||
-		strings.Contains(msg, "handshake failure")
+	for _, alert := range []string{
+		"tls: bad certificate",
+		"tls: certificate required",
+		"tls: revoked certificate",
+		"tls: expired certificate",
+		"tls: unknown certificate",
+		"tls: unsupported certificate",
+		"tls: unknown certificate authority",
+		"tls: access denied",
+		"tls: handshake failure",
+		"handshake failure",
+	} {
+		if strings.Contains(msg, alert) {
+			return true
+		}
+	}
+	return false
 }

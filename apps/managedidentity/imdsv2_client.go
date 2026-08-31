@@ -31,11 +31,16 @@ import (
 // start would mean a fresh certificate on every start, and IMDS rate limits
 // credential issuance.
 //
-// The name carries the isolation contract. A key created by an earlier build
-// without per-boot isolation still opens and still reports itself as isolated,
-// so it would be inherited silently and produce an attestation statement the
-// service refuses. Changing the container is what retires those keys.
-const bindingKeyName = "com.microsoft.msal-go.imdsv2-binding-key.perboot"
+// The name is the one MSAL .NET uses, as WindowsCngKeyOperations.KeyGuardKeyName.
+// Sharing the container is what lets the two libraries reuse each other's
+// binding key and, with it, the certificates persisted against that key: a
+// virtual machine running both ends up with one VBS key and one credential
+// rather than two of each, and only one call against a rate-limited service.
+//
+// Both libraries open an existing key before creating one, so sharing the
+// container is a read on the common path; the overwrite flag only applies when
+// no key is there to open.
+const bindingKeyName = "KeyGuardRSAKey"
 
 // imdsV2 carries everything the IMDSv2 legs need. It is split out from Client so
 // the IMDS calls can be exercised against a test server without constructing a

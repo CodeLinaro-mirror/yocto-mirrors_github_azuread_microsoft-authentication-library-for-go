@@ -199,6 +199,10 @@ type AcquireTokenOptions struct {
 	// attestation requests that the binding key be attested before IMDS issues
 	// a certificate for it.
 	attestation bool
+	// minStrength is the weakest key binding the caller will accept.
+	minStrength MtlsBindingStrength
+	// forceRefresh bypasses the token cache for this request.
+	forceRefresh bool
 }
 
 type ClientOption func(*Client)
@@ -238,6 +242,45 @@ func WithClaims(claims string) AcquireTokenOption {
 func WithAttestationSupport() AcquireTokenOption {
 	return func(o *AcquireTokenOptions) {
 		o.attestation = true
+	}
+}
+
+// WithMtlsPoPMinStrength requires the host to be able to bind a token at least
+// as strongly as the given tier, and fails the request if it cannot.
+//
+// Without it, a request takes whatever binding the host offers. That is the
+// right default for most callers, but it means a workload that must run on
+// attested hardware has no way to say so: it would receive a token bound to a
+// weaker key and never learn the difference. Setting a floor turns that into an
+// error, [ErrMinStrengthNotMet], raised before any credential is issued.
+//
+// The check runs host capability discovery, whose result is reused for the
+// lifetime of the process. Passing [MtlsBindingStrengthNone] imposes no floor
+// and skips discovery entirely, which is the same as not using this option.
+//
+// Tokens acquired under a floor are cached separately from tokens acquired
+// without one, so raising the floor cannot be satisfied by a token that was
+// issued before it was set.
+func WithMtlsPoPMinStrength(strength MtlsBindingStrength) AcquireTokenOption {
+	return func(o *AcquireTokenOptions) {
+		o.minStrength = strength
+	}
+}
+
+// WithForceRefresh skips the token cache and acquires a new token from the
+// service.
+//
+// The cache already refreshes a token before it expires, so this is not needed
+// to keep a token fresh. Use it when something outside this library has changed
+// what a token should contain, for example after a role assignment, where a
+// cached token is still valid but no longer carries the right authorization.
+//
+// It does not discard the binding certificate: the certificate identifies the
+// machine and is unaffected by the token becoming stale, and re-minting one per
+// call would be throttled by the metadata service.
+func WithForceRefresh() AcquireTokenOption {
+	return func(o *AcquireTokenOptions) {
+		o.forceRefresh = true
 	}
 }
 
@@ -374,6 +417,7 @@ func (c Client) AcquireToken(ctx context.Context, resource string, options ...Ac
 		return AuthResult{}, err
 	}
 	c.authParams.Scopes = []string{resource}
+	o.stampCacheComponents(&c.authParams)
 
 	// A certificate-bound token is cached under a scheme keyed by the
 	// certificate it is bound to, so the cache can only be consulted once that
@@ -381,7 +425,7 @@ func (c Client) AcquireToken(ctx context.Context, resource string, options ...Ac
 	// have been cached either, and reading the cache with the default scheme
 	// would match a bearer token and hand back an unbound credential for a
 	// request that explicitly asked for a bound one.
-	readCache := o.claims == ""
+	readCache := o.claims == "" && !o.forceRefresh
 	var cachedBinding *bindingCertificate
 	if o.mtlsPoP {
 		if binding, ok := certCache.get(cacheKey(c.miType, o.attestation)); ok {
