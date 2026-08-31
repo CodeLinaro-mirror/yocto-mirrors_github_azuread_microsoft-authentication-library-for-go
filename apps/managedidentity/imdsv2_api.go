@@ -5,6 +5,7 @@ package managedidentity
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -197,10 +198,10 @@ func (c Client) authResultForIMDSv2(tr accesstokens.TokenResponse, binding *bind
 // re-parsed from that copy, so the result shares no backing array with the
 // cached certificate.
 //
-// The private key is necessarily the same object, because it is a handle to one
-// operating system key. The copy therefore takes a reference on the binding
-// certificate so that evicting the cache entry cannot release a key this
-// certificate still needs, and drops it once the caller lets the copy go.
+// The private key is necessarily backed by the same object, because it is a
+// handle to one operating system key. The copy therefore takes a reference on
+// the binding certificate so that evicting the cache entry cannot release a key
+// this certificate still needs, and drops it once the caller lets the key go.
 func copyBindingCertificate(binding *bindingCertificate) *tls.Certificate {
 	chain := make([][]byte, len(binding.TLS.Certificate))
 	for i, der := range binding.TLS.Certificate {
@@ -220,9 +221,33 @@ func copyBindingCertificate(binding *bindingCertificate) *tls.Certificate {
 		// practice; sharing the cached leaf is still better than returning none.
 		out.Leaf = binding.Leaf
 	}
-	binding.retain()
-	runtime.SetFinalizer(out, func(*tls.Certificate) { _ = binding.Close() })
+	if signer, ok := binding.TLS.PrivateKey.(crypto.Signer); ok {
+		binding.retain()
+		out.PrivateKey = newRetainedSigner(signer, binding.Close)
+	}
 	return out
+}
+
+// retainedSigner is the private key handed to a caller. It holds a reference on
+// the cached binding certificate for exactly as long as the caller can still
+// sign with it.
+//
+// The reference is attached to the signer rather than to the *tls.Certificate
+// because callers routinely copy the certificate by value, as in
+// cert := *result.BindingCertificate. A finalizer on the certificate pointer
+// would then see that pointer become unreachable while the value copy is still
+// in use, and release the key underneath the caller. The private key survives
+// every such copy, so it is the only place the reference can safely live. This
+// mirrors what SafeHandle does for the same certificate in MSAL .NET.
+type retainedSigner struct {
+	crypto.Signer
+	release func() error
+}
+
+func newRetainedSigner(signer crypto.Signer, release func() error) *retainedSigner {
+	held := &retainedSigner{Signer: signer, release: release}
+	runtime.SetFinalizer(held, func(h *retainedSigner) { _ = h.release() })
+	return held
 }
 
 // mtlsClient builds the client used for the IMDSv2 token leg, honouring

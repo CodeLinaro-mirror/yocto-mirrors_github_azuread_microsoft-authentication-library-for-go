@@ -331,6 +331,11 @@ var mtlsClientCache = struct {
 	clients map[string]*http.Client
 }{clients: map[string]*http.Client{}}
 
+// mtlsClientCacheLimit bounds the cache. A process needs one client per live
+// identity and attestation mode, so the working set is small; the limit only
+// stops a long-running process from accumulating a transport per re-mint.
+const mtlsClientCacheLimit = 8
+
 // mtlsHTTPClient returns a client that presents the binding certificate. The
 // client is keyed by the certificate itself so that replacing the certificate
 // cannot reuse a pooled connection authenticated with the previous one.
@@ -346,9 +351,13 @@ func mtlsHTTPClient(cert tls.Certificate) *http.Client {
 	if client, ok := mtlsClientCache.clients[key]; ok {
 		return client
 	}
-	// A different certificate is now in use, so nothing pooled under the old one
-	// can be reused. Release those connections rather than leaving them idle.
+	// Evicting only over the limit, rather than every time the certificate
+	// changes, is what lets two identities alternate without rebuilding a
+	// transport on every acquisition.
 	for old, client := range mtlsClientCache.clients {
+		if len(mtlsClientCache.clients) < mtlsClientCacheLimit {
+			break
+		}
 		client.CloseIdleConnections()
 		delete(mtlsClientCache.clients, old)
 	}

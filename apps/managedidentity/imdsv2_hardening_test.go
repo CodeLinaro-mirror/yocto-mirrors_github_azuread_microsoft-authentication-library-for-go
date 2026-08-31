@@ -15,6 +15,7 @@ import (
 	"errors"
 	"io"
 	"math/big"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -501,6 +502,77 @@ func TestIMDSv2ReusesOneHTTPClientPerCertificate(t *testing.T) {
 	third := mtlsHTTPClient(selfSignedTLSCertificate(t))
 	if third == first {
 		t.Fatal("a different certificate reused the previous client, so a pooled connection could carry the wrong certificate")
+	}
+}
+
+func TestIMDSv2BindingCertificateSurvivesCallerValueCopy(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	client := fake.newTestClient(t, SystemAssigned(), &revocableKeyProvider{})
+
+	// Callers copy the certificate by value — the README sample and the
+	// GetClientCertificate callback both do. Once they have, the *tls.Certificate
+	// this package returned is unreachable, so any release tied to that pointer
+	// runs while the copy is still the thing presenting the key on a handshake.
+	signer := func() crypto.Signer {
+		result, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession())
+		if err != nil {
+			t.Fatalf("AcquireToken: %v", err)
+		}
+		cert := *result.BindingCertificate
+		s, ok := cert.PrivateKey.(crypto.Signer)
+		if !ok {
+			t.Fatal("the binding certificate's private key is not a signer")
+		}
+		return s
+	}()
+
+	// Drop the cache's reference, as a re-mint or an identity change would. The
+	// caller's copy is now the only thing keeping the key alive.
+	certCache.clear()
+
+	// Make the returned *tls.Certificate collectable and give finalizers a
+	// chance to run before the key is used.
+	for i := 0; i < 3; i++ {
+		runtime.GC()
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	digest := sha256.Sum256([]byte("payload signed from a by-value copy"))
+	if _, err := signer.Sign(rand.Reader, digest[:], crypto.SHA256); err != nil {
+		t.Fatalf("signing from a by-value copy of the certificate failed: %v", err)
+	}
+}
+
+func TestIMDSv2AlternatingCertificatesKeepTheirClients(t *testing.T) {
+	first := selfSignedTLSCertificate(t)
+	second := selfSignedTLSCertificate(t)
+
+	firstClient := mtlsHTTPClient(first)
+	secondClient := mtlsHTTPClient(second)
+	if firstClient == secondClient {
+		t.Fatal("two certificates shared a client")
+	}
+	// Two identities in one process alternate. Dropping the previous client
+	// every time the certificate changes would rebuild a transport on every
+	// acquisition, which is the churn the cache exists to remove.
+	if mtlsHTTPClient(first) != firstClient {
+		t.Fatal("alternating certificates evicted each other's client")
+	}
+	if mtlsHTTPClient(second) != secondClient {
+		t.Fatal("alternating certificates evicted each other's client")
+	}
+}
+
+func TestIMDSv2MtlsClientCacheIsBounded(t *testing.T) {
+	for i := 0; i < mtlsClientCacheLimit*3; i++ {
+		mtlsHTTPClient(selfSignedTLSCertificate(t))
+	}
+	mtlsClientCache.mu.Lock()
+	size := len(mtlsClientCache.clients)
+	mtlsClientCache.mu.Unlock()
+	if size > mtlsClientCacheLimit {
+		t.Fatalf("cached clients = %d, want at most %d", size, mtlsClientCacheLimit)
 	}
 }
 
