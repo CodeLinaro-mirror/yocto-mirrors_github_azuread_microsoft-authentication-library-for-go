@@ -38,13 +38,15 @@ const (
 	imdsGoneRetryAfter = 10 * time.Second
 )
 
-// imdsRetriableStatus reports whether an IMDS response should be retried. It
-// mirrors HttpRetryConditions.Imds in MSAL .NET.
+// imdsRetriableStatus reports whether an IMDS response should be retried on the
+// acquisition path. It mirrors HttpRetryConditions.Imds in MSAL .NET.
 //
 // 404 is retriable even though this package treats a persistent 404 as the
-// capability answer "this host only serves IMDSv1". A single 404 can also come
-// from an agent that has not finished starting, so the answer is only believed
-// after the retries are exhausted.
+// capability answer "this host only serves IMDSv1". A caller on this path has
+// asked for IMDSv2, so a 404 contradicts the request, and a single one can come
+// from an agent that has not finished starting: the answer is only believed
+// after the retries are exhausted. Capability discovery asks a different
+// question and uses imdsProbeRetriableStatus instead.
 func imdsRetriableStatus(status int) bool {
 	switch status {
 	case http.StatusNotFound, http.StatusRequestTimeout, http.StatusGone, http.StatusTooManyRequests:
