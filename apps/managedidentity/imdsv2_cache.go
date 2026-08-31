@@ -124,10 +124,20 @@ func isOrphaned(cert *bindingCertificate, provider keyProvider) bool {
 }
 
 // bindingCertRefreshWindow is how long before its expiry a cached binding
-// certificate stops being reused. Presenting a certificate that expires mid
-// request costs a wasted mTLS round trip and surfaces as an opaque rejection
-// from Entra, so it is re-minted slightly early instead.
-const bindingCertRefreshWindow = 5 * time.Minute
+// certificate stops being reused.
+//
+// The window is a day rather than a few minutes because the access token
+// outlives the request that fetched it. Entra issues managed identity tokens
+// with roughly a day of life and binds them to this certificate, so a
+// certificate that expires first leaves the caller holding a token it cannot
+// spend: the resource rejects the TLS handshake, and nothing in the token
+// itself says why. Refusing to bind a new token to a certificate with less
+// than a token's lifetime left keeps the certificate outliving every token
+// issued against it.
+//
+// This is the window MSAL .NET applies, as
+// CertificateCacheEntry.MinRemainingLifetime, for the same reason.
+const bindingCertRefreshWindow = 24 * time.Hour
 
 // needsRefresh reports whether a cached certificate is at or past its refresh
 // window and should be re-minted rather than reused.
@@ -179,6 +189,13 @@ func (v imdsV2) getBindingCertificate(ctx context.Context, attested bool) (*bind
 	cert, err := v.issueBindingCertificate(ctx, correlationID, metadata, attested)
 	if err != nil {
 		return nil, "", err
+	}
+	// A certificate that is already inside the refresh window is used for this
+	// request but not cached: a later caller would only reject it on read, so
+	// storing it would hold a key handle open for nothing. MSAL .NET applies
+	// the same rule on write, in InMemoryCertificateCache.Set.
+	if needsRefresh(cert) {
+		return cert, key, nil
 	}
 	// The cache takes over the reference newBindingCertificate created; the
 	// caller gets one of its own.

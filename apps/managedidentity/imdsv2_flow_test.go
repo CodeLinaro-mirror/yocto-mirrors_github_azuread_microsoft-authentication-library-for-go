@@ -147,7 +147,7 @@ func newIMDSFake(t *testing.T) *imdsFake {
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "imds-test-ca"},
 		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
+		NotAfter:              time.Now().Add(90 * 24 * time.Hour),
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
@@ -172,7 +172,9 @@ func newIMDSFake(t *testing.T) *imdsFake {
 		issueStatus:    http.StatusOK,
 		tokenType:      "mtls_pop",
 
-		certLifetime:        time.Hour,
+		// Comfortably outside bindingCertRefreshWindow, so the default fixture
+		// certificate is cacheable; a test that wants a stale one sets its own.
+		certLifetime:        30 * 24 * time.Hour,
 		attestationEndpoint: "https://attestation.example",
 	}
 

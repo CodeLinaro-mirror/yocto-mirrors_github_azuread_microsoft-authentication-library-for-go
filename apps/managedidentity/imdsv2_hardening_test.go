@@ -242,10 +242,33 @@ func TestIMDSv2ReissuesCertificateNearingExpiry(t *testing.T) {
 	}
 }
 
+// A certificate that is already inside the refresh window is used for the
+// request that minted it but must not be stored: a later caller would reject it
+// on read, so caching it would pin a key handle open for nothing. The
+// reissue test above passes with or without the write-side guard, because the
+// read-side check also forces a re-mint, so the cache is inspected directly.
+func TestIMDSv2DoesNotCacheACertificateBornInsideTheRefreshWindow(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.certLifetime = time.Minute
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession()); err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+
+	certCache.mu.Lock()
+	cached := len(certCache.entries)
+	certCache.mu.Unlock()
+	if cached != 0 {
+		t.Errorf("the certificate cache holds %d entries, want a certificate inside the refresh window not to be stored", cached)
+	}
+}
+
 func TestIMDSv2ReusesCertificateOutsideRefreshWindow(t *testing.T) {
 	withCleanCaches(t)
 	fake := newIMDSFake(t)
-	fake.certLifetime = time.Hour
+	fake.certLifetime = 30 * 24 * time.Hour
 	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
 
 	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession()); err != nil {
