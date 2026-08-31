@@ -15,6 +15,7 @@ import (
 	"errors"
 	"io"
 	"math/big"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -426,6 +427,58 @@ func TestIMDSv2AcceptsBareHostAttestationEndpoint(t *testing.T) {
 	}
 	if seen != "https://attestation.example" {
 		t.Fatalf("attestation endpoint = %q, want it normalized to https", seen)
+	}
+}
+
+func TestIMDSv2NormalizesAttestationEndpointToTheValidatedOrigin(t *testing.T) {
+	// The native library parses this URL a second time with C++ rules. Anything
+	// handed to it must therefore be the origin net/url actually validated, not
+	// the string that happened to pass validation: a parser that folds
+	// backslashes to slashes reads "https:/\/\attacker.example" as
+	// attacker.example, while net/url reads its host as "https". Returning the
+	// rebuilt origin closes that gap. Each case below must never reach the
+	// native library carrying the attacker's host.
+	for _, test := range []struct {
+		name     string
+		endpoint string
+	}{
+		{"backslash authority", `https:/\/\attacker.example`},
+		{"single backslash", `https:/\attacker.example`},
+		{"path is dropped", "https://attestation.example/../attacker.example"},
+		{"query is dropped", "https://attestation.example/?next=attacker.example"},
+		{"fragment is dropped", "https://attestation.example/#attacker.example"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			withCleanCaches(t)
+			fake := newIMDSFake(t)
+			fake.attestationEndpoint = test.endpoint
+			var seen string
+			original := attestKeyGuardFn
+			attestKeyGuardFn = func(endpoint, clientID string, key bindingKey) (string, error) {
+				seen = endpoint
+				return stubAttestationJWT(t, time.Now().Add(time.Hour)), nil
+			}
+			t.Cleanup(func() { attestKeyGuardFn = original })
+			client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+			// Whether the acquisition succeeds is not the point; an endpoint
+			// that survives validation but resolves somewhere else is.
+			_, _ = client.AcquireToken(context.Background(), "https://vault.azure.net",
+				WithMtlsProofOfPossession(), WithAttestationSupport())
+
+			if strings.Contains(seen, "attacker.example") {
+				t.Fatalf("the native library was handed %q, which carries the attacker's host", seen)
+			}
+			if seen != "" {
+				u, err := url.Parse(seen)
+				if err != nil {
+					t.Fatalf("the native library was handed an unparseable endpoint %q: %v", seen, err)
+				}
+				if want := "https://" + u.Host; seen != want {
+					t.Fatalf("endpoint = %q, want the bare validated origin %q", seen, want)
+				}
+			}
+		})
 	}
 }
 

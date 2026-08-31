@@ -94,6 +94,23 @@ func (m csrMetadata) validate() error {
 // be able to redirect attestation to an endpoint of the attacker's choosing, or
 // downgrade it to plaintext. The native library fetches its own managed identity
 // token for this call, so the endpoint is a credential-bearing destination.
+//
+// The origin is rebuilt from the parsed host rather than returning the string
+// that was validated. The native library parses this URL again with C++ rules,
+// and a string can parse differently there than it does in net/url: Go reads
+// the host of "https:/\/\example.com" as "https", while a parser that folds
+// backslashes to slashes reads it as "example.com". Returning only scheme and
+// host means the endpoint that was checked is byte-for-byte the endpoint that
+// is used. MAA endpoints are bare origins, so nothing is lost by dropping any
+// path, query or fragment.
+//
+// Validation stops at the origin: the host itself is whatever IMDS said, and is
+// deliberately not checked against a list of known MAA hosts. Such a list would
+// have to track every sovereign and Arc-connected cloud, and would fail closed
+// on any new region before the list caught up. An attestation statement is only
+// useful to the endpoint that issued it, and the token the native library sends
+// is scoped to the attestation audience, so a redirected call cannot be replayed
+// at a resource. Leg 1 is the trust boundary for this value.
 func (m csrMetadata) attestationURL() (string, error) {
 	if m.AttestationEndpoint == "" {
 		return "", fmt.Errorf("managedidentity: attestation was requested but IMDS returned no attestationEndpoint")
@@ -112,7 +129,7 @@ func (m csrMetadata) attestationURL() (string, error) {
 	if u.Hostname() == "" {
 		return "", fmt.Errorf("managedidentity: IMDS returned an attestation endpoint with no host %q", m.AttestationEndpoint)
 	}
-	return raw, nil
+	return "https://" + u.Host, nil
 }
 
 // certificateRequestBody is the /issuecredential request. AttestationToken is
@@ -158,10 +175,16 @@ func (r certificateRequestResponse) validate() error {
 }
 
 // validateIMDSServerHeader rejects a response that does not look like it came
-// from IMDS. Because the IMDS legs are unauthenticated plain HTTP to a
-// link-local address, this header is the only signal that the responder is the
-// real instance metadata service rather than something else that answered on
-// that address.
+// from IMDS. This is a misrouting check, not a security control: the IMDS legs
+// are unauthenticated plain HTTP to a link-local address, so anything that can
+// answer on that address can also set this header. What it catches is a proxy,
+// a captive portal or an unrelated local listener answering on 169.254.169.254,
+// which otherwise surfaces as a confusing parse failure further along.
+//
+// The protections that do hold against a hostile responder are elsewhere: the
+// issued certificate must carry the public half of the VBS key
+// ([certificateMatchesKey]), and any token ultimately has to be signed
+// by Entra to be accepted by a resource.
 func validateIMDSServerHeader(resp *http.Response) error {
 	server := resp.Header.Get(imdsV2ServerHeader)
 	if server == "" {
