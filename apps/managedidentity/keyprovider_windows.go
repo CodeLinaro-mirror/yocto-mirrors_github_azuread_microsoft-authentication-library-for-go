@@ -59,6 +59,14 @@ const (
 
 	ncryptLengthProperty       = "Length"
 	ncryptExportPolicyProperty = "Export Policy"
+	// ncryptKeyUsageProperty is NCRYPT_KEY_USAGE_PROPERTY.
+	ncryptKeyUsageProperty = "Key Usage"
+	// ncryptAllowAllUsages is NCRYPT_ALLOW_ALL_USAGES. MSAL .NET sets it when
+	// it creates the KeyGuard key (CngKeyCreationParameters.KeyUsage =
+	// AllUsages). Without it the key takes the KSP's default usage mask, which
+	// can refuse the signature the CSR needs on hosts whose policy narrows that
+	// default.
+	ncryptAllowAllUsages = 0x00ffffff
 	// ncryptVirtualIsoProperty is NCRYPT_VIRTUAL_ISO_PROPERTY. CNG sets it to 1
 	// for keys whose private material is held by the VBS trustlet, which is what
 	// "KeyGuard" means in practice.
@@ -269,6 +277,14 @@ func createPersistedKey(provider windows.Handle, name *uint16) (windows.Handle, 
 		freeNCryptObject(key)
 		return 0, err
 	}
+	// MSAL .NET sets KeyUsage = AllUsages on the KeyGuard key it creates
+	// (CngKeyCreationParameters). Left unset, the key takes the KSP's default
+	// usage mask, so a host whose policy narrows that default would refuse the
+	// CSR signature on a key this library had already reported as usable.
+	if err := setDWORDProperty(key, ncryptKeyUsageProperty, ncryptAllowAllUsages); err != nil {
+		freeNCryptObject(key)
+		return 0, err
+	}
 	status, _, _ = syscall.SyscallN(procNCryptFinalizeKey.Addr(), uintptr(key), uintptr(ncryptSilentFlag))
 	if status != 0 {
 		freeNCryptObject(key)
@@ -283,13 +299,18 @@ func createPersistedKey(provider windows.Handle, name *uint16) (windows.Handle, 
 // isolated material behind it is gone. Only attempting to use it tells the
 // difference, and doing so here turns a confusing failure during the TLS
 // handshake into a clean re-mint.
+//
+// The probe uses PSS-SHA256 with a hash-length salt because that is exactly
+// what the CSR signature uses. Probing with a padding the real work does not
+// use would let a key that CNG will only sign PKCS1 with pass here and fail at
+// the CSR, which is the failure this function exists to prevent.
 func keyCanSign(key windows.Handle) bool {
 	algID, err := algorithmIdentifier(crypto.SHA256)
 	if err != nil {
 		return false
 	}
 	digest := make([]byte, crypto.SHA256.Size())
-	padInfo := bcryptPKCS1PaddingInfo{pszAlgID: algID}
+	padInfo := bcryptPSSPaddingInfo{pszAlgID: algID, cbSalt: uint32(crypto.SHA256.Size())}
 	defer runtime.KeepAlive(algID)
 	defer runtime.KeepAlive(&padInfo)
 
@@ -297,7 +318,7 @@ func keyCanSign(key windows.Handle) bool {
 	status, _, _ := syscall.SyscallN(procNCryptSignHash.Addr(),
 		uintptr(key), uintptr(unsafe.Pointer(&padInfo)),
 		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
-		0, 0, uintptr(unsafe.Pointer(&needed)), bcryptPadPKCS1Flag|ncryptSilentFlag,
+		0, 0, uintptr(unsafe.Pointer(&needed)), bcryptPadPSSFlag|ncryptSilentFlag,
 	)
 	if status != 0 || needed == 0 {
 		return false
@@ -312,7 +333,7 @@ func keyCanSign(key windows.Handle) bool {
 		uintptr(key), uintptr(unsafe.Pointer(&padInfo)),
 		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
 		uintptr(unsafe.Pointer(&signature[0])), uintptr(len(signature)),
-		uintptr(unsafe.Pointer(&needed)), bcryptPadPKCS1Flag|ncryptSilentFlag,
+		uintptr(unsafe.Pointer(&needed)), bcryptPadPSSFlag|ncryptSilentFlag,
 	)
 	return status == 0
 }

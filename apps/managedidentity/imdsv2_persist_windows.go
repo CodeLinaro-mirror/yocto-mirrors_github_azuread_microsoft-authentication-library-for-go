@@ -277,7 +277,12 @@ func clientIDFromSubject(leaf *x509.Certificate) (string, bool) {
 	if !looksLikeGUID(cn) {
 		return "", false
 	}
-	return cn, true
+	// Lowercased because the client ID read back here reaches a token-cache
+	// partition key, and a certificate whose CN came back upper-cased would
+	// otherwise land in a different partition than the same identity acquired
+	// without the persisted certificate. MSAL .NET normalizes client IDs the
+	// same way before they reach a cache key.
+	return strings.ToLower(cn), true
 }
 
 func looksLikeGUID(s string) bool {

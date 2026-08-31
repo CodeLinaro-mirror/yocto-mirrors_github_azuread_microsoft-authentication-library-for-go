@@ -227,20 +227,40 @@ func validateIMDSServerHeader(resp *http.Response) error {
 }
 
 // imdsErrorResponse is the error shape both IMDS legs use.
+//
+// IMDS is not consistent about which fields it fills. The OAuth-style pair is
+// the documented shape, but some failures answer with a bare "message" instead,
+// and most carry a correlationId that is the only handle a support engineer can
+// use to find the request in the service's own logs. MSAL .NET reads all of
+// them (ManagedIdentityErrorResponse: Message, Error, ErrorDescription,
+// CorrelationId), so a Go caller filing the same incident has the same
+// identifier to quote.
 type imdsErrorResponse struct {
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
+	Message          string `json:"message"`
+	CorrelationID    string `json:"correlationId"`
 }
 
 func (e imdsErrorResponse) String() string {
+	var s string
 	switch {
 	case e.Error != "" && e.ErrorDescription != "":
-		return fmt.Sprintf("%s: %s", e.Error, e.ErrorDescription)
+		s = fmt.Sprintf("%s: %s", e.Error, e.ErrorDescription)
 	case e.Error != "":
-		return e.Error
+		s = e.Error
+	case e.ErrorDescription != "":
+		s = e.ErrorDescription
 	default:
-		return e.ErrorDescription
+		s = e.Message
 	}
+	if s == "" {
+		return ""
+	}
+	if e.CorrelationID != "" {
+		s = fmt.Sprintf("%s (correlation ID %s)", s, e.CorrelationID)
+	}
+	return s
 }
 
 // parseIMDSError extracts the error payload IMDS returns on a non-200. The body

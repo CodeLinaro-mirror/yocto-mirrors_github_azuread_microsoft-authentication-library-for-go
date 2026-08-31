@@ -5,7 +5,6 @@ package managedidentity
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
 	"fmt"
 	"sync"
@@ -307,12 +306,19 @@ func (c *bindingCertCache) adopt(key string, cert *bindingCertificate) {
 // happens the cached certificate still parses and still looks valid, but the
 // private key behind it is gone, so the TLS handshake fails in a way that is
 // hard to attribute. Comparing the public keys detects it up front.
+//
+// The check runs on every read rather than being cached for an interval. It is
+// not free - it opens the provider, opens the key, proves the key can sign with
+// a real RSA-2048 operation inside the VBS trustlet, and exports two public
+// blobs - but MSAL .NET revalidates on every cache read too
+// (ImdsV2ManagedIdentitySource's cached-certificate path calls
+// IsKeyGuardProtected and re-derives the key each time), and the global
+// token-request gate now serializes acquisitions, so a service taking a token
+// per inbound request no longer multiplies this cost across concurrent
+// requests. Trusting a stale healthy answer would let a certificate whose key
+// vanished mid-window reach the handshake, which is exactly the failure this
+// function exists to prevent.
 func isOrphaned(cert *bindingCertificate, provider keyProvider) bool {
-	sum := sha256.Sum256(cert.Leaf.Raw)
-	key := string(sum[:])
-	if orphanCheckIsFresh(key) {
-		return false
-	}
 	current, err := provider.getOrCreateKey(bindingKeyName)
 	if err != nil {
 		// The key cannot be reached at all, so the cached certificate is not
@@ -320,69 +326,7 @@ func isOrphaned(cert *bindingCertificate, provider keyProvider) bool {
 		return true
 	}
 	defer func() { _ = current.Close() }()
-	if certificateMatchesKey(cert.Leaf, current) != nil {
-		forgetOrphanCheck(key)
-		return true
-	}
-	recordOrphanCheck(key)
-	return false
-}
-
-// orphanCheckTTL is how long a healthy orphan check is trusted.
-//
-// isOrphaned sits on the token-cache fast path: an acquisition consults it
-// before reading the cache and again while acquiring. Each call opens the
-// provider, opens the key, proves the key can sign - a real RSA-2048 private-key
-// operation inside the VBS trustlet - exports two public blobs and frees two
-// objects. A service acquiring a token per inbound request would pay a trustlet
-// signature per request to answer a question whose answer only changes when the
-// isolated container is reset, which is a reboot-scale event.
-//
-// Only a healthy answer is cached, and only briefly. Trusting a stale healthy
-// answer costs one failed handshake, which shouldRemintCertificate recognises as
-// the binding key failing and repairs by reminting - the same recovery the
-// uncached path takes. An orphaned answer is never cached, because the caller
-// discards the certificate on the spot.
-const orphanCheckTTL = 30 * time.Second
-
-var orphanChecks = struct {
-	mu sync.Mutex
-	at map[string]time.Time
-}{at: map[string]time.Time{}}
-
-func orphanCheckIsFresh(key string) bool {
-	orphanChecks.mu.Lock()
-	defer orphanChecks.mu.Unlock()
-	at, ok := orphanChecks.at[key]
-	return ok && time.Since(at) < orphanCheckTTL
-}
-
-func recordOrphanCheck(key string) {
-	orphanChecks.mu.Lock()
-	defer orphanChecks.mu.Unlock()
-	// Each reminted certificate would otherwise leave an entry behind for the
-	// life of the process. Expired entries are dropped here rather than on a
-	// timer because the map only ever holds the few certificates checked within
-	// one window.
-	for k, at := range orphanChecks.at {
-		if time.Since(at) >= orphanCheckTTL {
-			delete(orphanChecks.at, k)
-		}
-	}
-	orphanChecks.at[key] = time.Now()
-}
-
-func forgetOrphanCheck(key string) {
-	orphanChecks.mu.Lock()
-	defer orphanChecks.mu.Unlock()
-	delete(orphanChecks.at, key)
-}
-
-// clearOrphanCheckCache discards every recorded orphan check.
-func clearOrphanCheckCache() {
-	orphanChecks.mu.Lock()
-	defer orphanChecks.mu.Unlock()
-	orphanChecks.at = map[string]time.Time{}
+	return certificateMatchesKey(cert.Leaf, current) != nil
 }
 
 // bindingCertRefreshWindow is how long before its expiry a cached binding

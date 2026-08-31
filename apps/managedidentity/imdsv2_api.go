@@ -190,6 +190,16 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 		baseEndpoint: imdsV2BaseEndpoint(),
 	}
 
+	// Client capabilities travel in the same "claims" parameter as a
+	// server-issued challenge, merged rather than concatenated, so they are
+	// resolved once here and used for both attempts below. MSAL .NET performs
+	// the identical merge on this leg through TokenClient's
+	// ClaimsAndClientCapabilities.
+	claims, err := c.claimsAndCapabilities(o)
+	if err != nil {
+		return AuthResult{}, err
+	}
+
 	binding, key, err := v.getBindingCertificate(ctx, o.attestation)
 	if err != nil {
 		return AuthResult{}, err
@@ -198,7 +208,7 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 	// variable rather than capturing the first value.
 	defer func() { _ = binding.Close() }()
 
-	tr, err := requestEntraToken(ctx, c.mtlsClient(binding.TLS), binding, resource, o.claims, o.mtlsPoP, c.retryPolicyEnabled)
+	tr, err := requestEntraToken(ctx, c.mtlsClient(binding.TLS), binding, resource, claims, o.mtlsPoP, c.retryPolicyEnabled)
 	if err != nil {
 		if !shouldRemintCertificate(err) {
 			return AuthResult{}, err
@@ -210,7 +220,7 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 		}
 		_ = binding.Close()
 		binding = reminted
-		tr, err = requestEntraToken(ctx, c.mtlsClient(binding.TLS), binding, resource, o.claims, o.mtlsPoP, c.retryPolicyEnabled)
+		tr, err = requestEntraToken(ctx, c.mtlsClient(binding.TLS), binding, resource, claims, o.mtlsPoP, c.retryPolicyEnabled)
 		if err != nil {
 			return AuthResult{}, err
 		}
@@ -220,6 +230,23 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 		return AuthResult{}, err
 	}
 	return c.authResultForIMDSv2(tr, binding, o)
+}
+
+// claimsAndCapabilities produces the value of the token request's claims
+// parameter.
+//
+// Client capabilities and a server-issued challenge share that one parameter,
+// so when both are present they have to be merged into a single JSON object;
+// sending either alone would drop the other. authority.AuthParams already
+// implements that merge for every other flow in this library, and reusing it
+// keeps managed identity's spelling identical to theirs.
+func (c Client) claimsAndCapabilities(o AcquireTokenOptions) (string, error) {
+	// With no capabilities configured, MergeCapabilitiesAndClaims returns
+	// Claims verbatim without parsing it, which is exactly the pass-through
+	// this leg did before capabilities existed.
+	p := c.authParams
+	p.Claims = o.claims
+	return p.MergeCapabilitiesAndClaims()
 }
 
 // verifyTokenType checks that the service returned the kind of token that was

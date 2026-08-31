@@ -145,7 +145,11 @@ var getAzureArcPlatformPath = func(platform string) string {
 var getAzureArcHimdsFilePath = func(platform string) string {
 	switch platform {
 	case "windows":
-		return filepath.Join(os.Getenv("ProgramData"), azureConnectedMachine, himdsExecutableName)
+		// The agent's binaries install under Program Files; ProgramData holds
+		// only its runtime state (the token directory above). MSAL .NET probes
+		// %Programfiles%\AzureConnectedMachineAgent\himds.exe
+		// (ManagedIdentityClient.WindowsHimdsFilePath).
+		return filepath.Join(os.Getenv("ProgramFiles"), azureConnectedMachine, himdsExecutableName)
 	case "linux":
 		return linuxHimdsPath
 	default:
@@ -184,6 +188,10 @@ type Client struct {
 	retryPolicyEnabled bool
 	canRefresh         *atomic.Value
 	mtlsClientFactory  func(cert tls.Certificate) *http.Client
+	// capabilities are the client capabilities set by WithClientCapabilities.
+	// They are held here rather than on authParams because options run before
+	// New builds authParams.
+	capabilities []string
 	// keyProvider overrides how the IMDSv2 binding key is produced. It is only
 	// set by tests; production always uses the platform provider.
 	keyProvider keyProvider
@@ -292,6 +300,31 @@ func WithHTTPClient(httpClient ops.HTTPClient) ClientOption {
 	}
 }
 
+// WithClientCapabilities allows configuring one or more client capabilities
+// such as "CP1".
+//
+// Capabilities are sent to Entra with every token request, and are the way a
+// caller tells Entra it can handle a claims challenge. They are only observed
+// on the IMDSv2 mTLS proof-of-possession flow, which is the only managed
+// identity flow in this package that talks to Entra directly; the other sources
+// exchange tokens through a local endpoint that has no parameter to carry them.
+// MSAL .NET applies the same restriction, listing only Service Fabric as
+// additionally able to forward them
+// (ManagedIdentitySourceExtensions.s_supportsClaimsAndCaps).
+//
+// This is a client option rather than a per-request one because a capability is
+// a statement about the calling application, which does not vary by request.
+// MSAL .NET places it on the application builder for the same reason
+// (ManagedIdentityApplicationBuilder.WithClientCapabilities).
+func WithClientCapabilities(capabilities []string) ClientOption {
+	return func(c *Client) {
+		// The slice is not copied here: New passes it to
+		// authority.NewClientCapabilities, which builds its own
+		// representations and does not retain it.
+		c.capabilities = capabilities
+	}
+}
+
 func WithRetryPolicyDisabled() ClientOption {
 	return func(c *Client) {
 		c.retryPolicyEnabled = false
@@ -369,6 +402,13 @@ func New(id ID, options ...ClientOption) (Client, error) {
 		return Client{}, err
 	}
 	client.authParams = authority.NewAuthParams(client.miType.value(), fakeAuthInfo)
+	if len(client.capabilities) > 0 {
+		cc, err := authority.NewClientCapabilities(client.capabilities)
+		if err != nil {
+			return Client{}, err
+		}
+		client.authParams.Capabilities = cc
+	}
 	return client, nil
 }
 
@@ -403,6 +443,35 @@ func GetSource() (Source, error) {
 // was created to test the function against refreshin
 var now = time.Now
 
+// miTokenGate serializes every managed identity token acquisition in the
+// process.
+//
+// The managed identity endpoints are per-machine services with their own
+// throttling, and a service that takes a token per inbound request will fan out
+// concurrent acquisitions for the same identity and resource on a cold cache.
+// Left unserialized those become simultaneous requests to a single local
+// endpoint, which answers 429; serialized, the first one populates the cache and
+// the rest read it. MSAL .NET holds the same process-wide gate for the same
+// reason (ManagedIdentityAuthRequest.s_semaphoreSlim: "Requests to a managed
+// identity endpoint must be throttled; otherwise, the endpoint will throw a HTTP
+// 429.").
+//
+// It is a buffered channel rather than a mutex so the wait can be abandoned when
+// the caller's context is cancelled. Ordering among waiters is not guaranteed
+// and does not need to be.
+var miTokenGate = make(chan struct{}, 1)
+
+// acquireMITokenGate blocks until this goroutine holds the gate, and returns the
+// function that releases it.
+func acquireMITokenGate(ctx context.Context) (func(), error) {
+	select {
+	case miTokenGate <- struct{}{}:
+		return func() { <-miTokenGate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // Acquires tokens from the configured managed identity on an azure resource.
 //
 // Resource: scopes application is requesting access to
@@ -419,63 +488,114 @@ func (c Client) AcquireToken(ctx context.Context, resource string, options ...Ac
 	c.authParams.Scopes = []string{resource}
 	o.stampCacheComponents(&c.authParams)
 
-	// A certificate-bound token is cached under a scheme keyed by the
-	// certificate it is bound to, so the cache can only be consulted once that
-	// certificate is known. When none has been issued yet no bound token can
-	// have been cached either, and reading the cache with the default scheme
-	// would match a bearer token and hand back an unbound credential for a
-	// request that explicitly asked for a bound one.
-	readCache := o.claims == "" && !o.forceRefresh
-	var cachedBinding *bindingCertificate
-	if o.mtlsPoP {
-		if binding, ok := certCache.get(cacheKey(c.miType, o.attestation)); ok {
-			// Serving a bound token straight from the cache skips leg 1, so the
-			// validation a normal acquisition performs has to happen here too.
-			// A certificate whose key was lost to a container reset still
-			// parses and still has the same thumbprint, so without this the
-			// caller would get a cached token plus a certificate it can no
-			// longer prove possession of.
-			if needsRefresh(binding) || isOrphaned(binding, c.bindingKeyProvider()) {
-				_ = binding.Close()
-				readCache = false
-			} else {
-				cachedBinding = binding
-				defer func() { _ = binding.Close() }()
-				c.authParams.AuthnScheme = authority.NewMtlsPoPAuthenticationScheme(binding.Leaf)
-			}
-		} else {
-			readCache = false
-		}
-	}
+	// Claims and an explicit force-refresh both mean the caller has said the
+	// cached token is not acceptable, so the cache is skipped in both
+	// directions: not read here, and not re-read under the gate below. MSAL
+	// .NET draws the same line (ManagedIdentityAuthRequest.GetAccessTokenAsync).
+	useCache := o.claims == "" && !o.forceRefresh
 
-	if readCache {
-		stResp, err := cacheManager.Read(ctx, c.authParams)
+	if useCache {
+		ar, refreshDue, hit, err := c.cachedAuthResult(ctx, o)
 		if err != nil {
 			return AuthResult{}, err
 		}
-		ar, err := base.AuthResultFromStorage(stResp)
-		if err == nil {
-			if !stResp.AccessToken.RefreshOn.T.IsZero() && !stResp.AccessToken.RefreshOn.T.After(now()) && c.canRefresh.CompareAndSwap(false, true) {
+		if hit {
+			// A token inside its refresh window is still usable, so this
+			// refresh runs on behalf of a caller that already has an answer.
+			// It goes straight to the network: re-reading the cache under the
+			// gate would find the very token that asked to be refreshed and
+			// return it unchanged. .NET makes the same exception for
+			// CacheRefreshReason.ProactivelyRefreshed.
+			if refreshDue && c.canRefresh.CompareAndSwap(false, true) {
 				defer c.canRefresh.Store(false)
-				if tr, er := c.getToken(ctx, resource, o); er == nil {
+				if tr, er := c.serializedToken(ctx, resource, o, false); er == nil {
 					return tr, nil
 				}
-			}
-			ar.AccessToken, err = c.authParams.AuthnScheme.FormatAccessToken(ar.AccessToken)
-			if err != nil {
-				return AuthResult{}, err
-			}
-			// A bound token is only usable by a caller that can also present the
-			// certificate it is bound to, so serving one from the cache without
-			// the certificate hands back a token that every resource rejects.
-			// The scheme lookup above already resolved that certificate.
-			if o.mtlsPoP {
-				ar.BindingCertificate = copyBindingCertificate(cachedBinding)
 			}
 			return ar, nil
 		}
 	}
+	return c.serializedToken(ctx, resource, o, useCache)
+}
+
+// serializedToken acquires a token while holding the process-wide managed
+// identity gate.
+//
+// recheckCache asks for one more cache read after the gate is held. A caller
+// that queued behind a cold-start stampede was told the cache was empty before
+// it began waiting, and by the time it is admitted the holder has usually
+// filled it; without the re-read every waiter would go on to make the request
+// the gate exists to prevent. .NET re-reads at the same point and for the same
+// stated reason ("in case the previous request cached a new token").
+func (c Client) serializedToken(ctx context.Context, resource string, o AcquireTokenOptions, recheckCache bool) (AuthResult, error) {
+	release, err := acquireMITokenGate(ctx)
+	if err != nil {
+		return AuthResult{}, err
+	}
+	defer release()
+
+	if recheckCache {
+		if ar, _, hit, err := c.cachedAuthResult(ctx, o); err == nil && hit {
+			return ar, nil
+		}
+	}
 	return c.getToken(ctx, resource, o)
+}
+
+// cachedAuthResult reports the token this request would be served from the
+// cache, if any.
+//
+// It resolves the binding certificate first because a certificate-bound token
+// is cached under a scheme keyed by that certificate, so the cache cannot be
+// consulted until it is known. When none has been issued yet no bound token can
+// have been cached either, and reading with the default scheme would match a
+// bearer token and hand back an unbound credential to a request that explicitly
+// asked for a bound one.
+//
+// refreshDue reports that a hit is inside its proactive-refresh window. c is
+// taken by value so the resolved scheme does not escape to the caller.
+func (c Client) cachedAuthResult(ctx context.Context, o AcquireTokenOptions) (_ AuthResult, refreshDue bool, hit bool, _ error) {
+	var cachedBinding *bindingCertificate
+	if o.mtlsPoP {
+		binding, ok := certCache.get(cacheKey(c.miType, o.attestation))
+		if !ok {
+			return AuthResult{}, false, false, nil
+		}
+		// Serving a bound token straight from the cache skips leg 1, so the
+		// validation a normal acquisition performs has to happen here too. A
+		// certificate whose key was lost to a container reset still parses and
+		// still has the same thumbprint, so without this the caller would get a
+		// cached token plus a certificate it can no longer prove possession of.
+		if needsRefresh(binding) || isOrphaned(binding, c.bindingKeyProvider()) {
+			_ = binding.Close()
+			return AuthResult{}, false, false, nil
+		}
+		cachedBinding = binding
+		defer func() { _ = binding.Close() }()
+		c.authParams.AuthnScheme = authority.NewMtlsPoPAuthenticationScheme(binding.Leaf)
+	}
+
+	stResp, err := cacheManager.Read(ctx, c.authParams)
+	if err != nil {
+		return AuthResult{}, false, false, err
+	}
+	ar, err := base.AuthResultFromStorage(stResp)
+	if err != nil {
+		return AuthResult{}, false, false, nil
+	}
+	refreshDue = !stResp.AccessToken.RefreshOn.T.IsZero() && !stResp.AccessToken.RefreshOn.T.After(now())
+	ar.AccessToken, err = c.authParams.AuthnScheme.FormatAccessToken(ar.AccessToken)
+	if err != nil {
+		return AuthResult{}, false, false, err
+	}
+	// A bound token is only usable by a caller that can also present the
+	// certificate it is bound to, so serving one from the cache without the
+	// certificate hands back a token that every resource rejects. The scheme
+	// lookup above already resolved that certificate.
+	if o.mtlsPoP {
+		ar.BindingCertificate = copyBindingCertificate(cachedBinding)
+	}
+	return ar, refreshDue, true, nil
 }
 
 func (c Client) getToken(ctx context.Context, resource string, o AcquireTokenOptions) (AuthResult, error) {

@@ -259,23 +259,25 @@ func (c Client) discoverCapabilities(ctx context.Context) (Capabilities, bool) {
 		miType:       c.miType,
 		retryEnabled: c.retryPolicyEnabled,
 		baseEndpoint: imdsV2BaseEndpoint(),
-		probe:        true,
 	}
-	if _, err := v.getCsrMetadata(ctx, newCorrelationID()); err != nil {
-		// A 404 is the host answering that it serves IMDSv1 only, which is
-		// settled and cannot change under a running process. Anything else - a
-		// 5xx, a throttle, a timeout - is a failure to obtain an answer rather
-		// than an answer, and the retries above have already given it every
-		// chance to succeed, so it is reported but not treated as final.
+	if err := v.probeEndpoint(ctx, newCorrelationID()); err != nil {
+		// MSAL .NET falls through to the IMDSv1 question on any v2 probe
+		// failure, not only on the one that says "no such endpoint"
+		// (ManagedIdentityClient.GetManagedIdentitySourceAsync: "If v2 fails,
+		// fall back to probing IMDS v1"), so a host that is briefly unwell on
+		// the v2 route still gets described from its compute document rather
+		// than reported as having no managed identity at all.
+		//
+		// Whether that description is worth remembering is a separate question.
+		// A 404 is the host answering that it has no v2 route, which is settled
+		// and cannot change under a running process. Anything else - a 5xx, a
+		// throttle, a timeout - is a failure to obtain an answer rather than an
+		// answer, and the retries above have already given it every chance, so
+		// the answer below is used but not cached. (.NET caches either outcome
+		// for the life of the process; a transient 500 there disables managed
+		// identity permanently.)
 		definitive := errors.Is(err, ErrMtlsPoPNotSupportedInIMDSv1)
-		if !definitive {
-			return Capabilities{
-				Source:                      DefaultToIMDS,
-				MaxSupportedBindingStrength: MtlsBindingStrengthNone,
-				ErrorReason:                 err.Error(),
-			}, false
-		}
-		return capabilitiesForIMDSv1(v, ctx, err), true
+		return capabilitiesForIMDSv1(v, ctx, err), definitive
 	}
 
 	return Capabilities{

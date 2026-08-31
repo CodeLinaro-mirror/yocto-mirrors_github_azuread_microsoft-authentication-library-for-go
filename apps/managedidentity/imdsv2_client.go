@@ -55,18 +55,52 @@ type imdsV2 struct {
 	// baseEndpoint is the IMDS root. It is a field so tests can point the two
 	// plain-HTTP legs at a local server.
 	baseEndpoint string
-	// probe marks this as a capability probe rather than an acquisition, which
-	// selects the retry policy for the metadata leg. MSAL .NET draws the same
-	// distinction with RequestType.ImdsProbe.
-	probe bool
 }
 
-// metadataRetriableStatus returns the retry policy for the metadata leg.
-func (v imdsV2) metadataRetriableStatus() func(int) bool {
-	if v.probe {
-		return imdsProbeRetriableStatus
+// probeEndpoint asks whether this host serves IMDSv2, without asking it for
+// anything.
+//
+// The request deliberately omits the Metadata header, and a 400 is the answer
+// that the host serves IMDSv2: only a host that routes /getplatformmetadata can
+// reject the request for the missing header, so the rejection is itself the
+// proof. MSAL .NET's probe is written the same way and treats the same single
+// status as success (ImdsManagedIdentitySource.ProbeImdsEndpointAsync, "probe
+// omits the Metadata: true header and then treats 400 Bad Request as success").
+//
+// Asking the question this way means a probe never sends a request the endpoint
+// would act on, and never depends on a body a probe has no use for. Any other
+// status, including 200 and 404, is the host answering that it does not serve
+// IMDSv2 here.
+func (v imdsV2) probeEndpoint(ctx context.Context, correlationID string) error {
+	target, err := v.endpoint(imdsV2CsrMetadataPath)
+	if err != nil {
+		return err
 	}
-	return imdsRetriableStatus
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return fmt.Errorf("managedidentity: building the IMDSv2 probe: %w", err)
+	}
+	// Only the correlation header. Metadata is the header whose absence this
+	// probe is testing for, and live IMDS still wants a request id.
+	req.Header.Set(imdsV2CorrelationIDHeader, correlationID)
+	req.Header.Set(imdsV2ClientRequestIDHeader, correlationID)
+
+	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled, imdsProbeRetriableStatus)
+	if err != nil {
+		return fmt.Errorf("managedidentity: probing for IMDSv2: %w", err)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusBadRequest {
+		return nil
+	}
+	// A host serving IMDSv1 only has no such route, so it answers 404. That is
+	// settled for the life of the process, and is reported as such so the
+	// caller can stop asking.
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrMtlsPoPNotSupportedInIMDSv1
+	}
+	return fmt.Errorf("managedidentity: the IMDSv2 probe returned %d", resp.StatusCode)
 }
 
 // endpoint builds an IMDS URL with the api version and any user-assigned
@@ -133,7 +167,7 @@ func (v imdsV2) getCsrMetadata(ctx context.Context, correlationID string) (csrMe
 	}
 	setIMDSHeaders(req, correlationID)
 
-	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled, v.metadataRetriableStatus())
+	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled, imdsRetriableStatus)
 	if err != nil {
 		return csrMetadata{}, fmt.Errorf("managedidentity: requesting platform metadata: %w", err)
 	}
@@ -163,18 +197,8 @@ func (v imdsV2) getCsrMetadata(ctx context.Context, correlationID string) (csrMe
 	if err := json.Unmarshal(body, &metadata); err != nil {
 		return csrMetadata{}, fmt.Errorf("managedidentity: parsing platform metadata: %w", err)
 	}
-	// A probe only asks whether this host serves IMDSv2, so it stops at a
-	// well-formed answer from something that identified itself as IMDS. MSAL
-	// .NET's probe does not read the body at all: it deliberately omits the
-	// Metadata header and treats the resulting 400 as proof the endpoint exists
-	// (ImdsManagedIdentitySource.ProbeImdsEndpointAsync). Applying the
-	// acquisition's content rules here would report a host as incapable over a
-	// field only an acquisition needs, and would do so non-definitively, so the
-	// probe would repeat on every retry interval for the life of the process.
-	if !v.probe {
-		if err := metadata.validate(); err != nil {
-			return csrMetadata{}, err
-		}
+	if err := metadata.validate(); err != nil {
+		return csrMetadata{}, err
 	}
 	return metadata, nil
 }
@@ -208,10 +232,13 @@ func (v imdsV2) issueCredential(ctx context.Context, correlationID, csr, attesta
 	// host already served /getplatformmetadata, so IMDSv2 exists and a 404 is an
 	// ordinary request failure. MSAL .NET reports it generically for the same
 	// reason.
-	if err := validateIMDSServerHeader(resp); err != nil {
-		resp.Body.Close()
-		return certificateRequestResponse{}, err
-	}
+	//
+	// The server header is deliberately not checked here either. MSAL .NET
+	// validates it on the metadata leg alone: ValidateCsrMetadataResponse has a
+	// single call site, in GetCsrMetadataAsync. That leg is the one that decides
+	// an unauthenticated responder is IMDS at all, and once it has, refusing an
+	// issuance response over a missing header would fail an acquisition that
+	// .NET completes.
 	body, err := readIMDSResponse(resp)
 	if err != nil {
 		return certificateRequestResponse{}, err
@@ -550,9 +577,17 @@ func (v imdsV2) getComputeMetadata(ctx context.Context, correlationID string) (c
 	return m, nil
 }
 
+// mtlsClientTimeout bounds one attempt against the token endpoint. MSAL .NET
+// sets no timeout on the client it builds for this leg
+// (PlatformsCommon/Shared/SimpleHttpClientFactory.CreateMtlsHttpClient), so it
+// inherits HttpClient's own default of 100 seconds; matching that number keeps
+// a slow-but-answering regional endpoint from failing here while succeeding
+// there. The retry loop applies it per attempt, as .NET's does.
+const mtlsClientTimeout = 100 * time.Second
+
 func newMtlsHTTPClient(cert tls.Certificate) *http.Client {
 	return &http.Client{
-		Timeout:       30 * time.Second,
+		Timeout:       mtlsClientTimeout,
 		CheckRedirect: refuseIMDSv2Redirect,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{

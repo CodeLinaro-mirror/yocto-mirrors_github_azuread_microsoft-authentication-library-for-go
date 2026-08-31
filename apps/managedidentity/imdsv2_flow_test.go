@@ -523,7 +523,6 @@ func withCleanCaches(t *testing.T) *fakePersistentCertCache {
 	clearAttestationCache()
 	clearMtlsClientCache()
 	clearCapabilitiesCache()
-	clearOrphanCheckCache()
 	cacheManager = storage.New(nil)
 	platformSupportsMtlsPoP = func() bool { return true }
 	// The real persistent cache is the user's own certificate store. A test
@@ -541,7 +540,6 @@ func withCleanCaches(t *testing.T) *fakePersistentCertCache {
 		clearAttestationCache()
 		clearMtlsClientCache()
 		clearCapabilitiesCache()
-		clearOrphanCheckCache()
 		cacheManager = storage.New(nil)
 		platformSupportsMtlsPoP = func() bool { return runtime.GOOS == "windows" }
 		retryWait = realWait

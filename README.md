@@ -555,6 +555,32 @@ It deliberately does **not** re-mint the binding certificate. The certificate id
 and is unaffected by a token going stale, and re-minting on every forced call would be throttled by
 IMDS.
 
+### Client capabilities
+
+`WithClientCapabilities` declares capabilities such as `CP1`, which tell Entra the application can
+handle a claims challenge:
+
+```go
+client, err := managedidentity.New(managedidentity.SystemAssigned(),
+    managedidentity.WithClientCapabilities([]string{"CP1"}),
+)
+```
+
+Capabilities are a property of the application rather than of a request, so this is a client option.
+They reach Entra on the IMDSv2 mTLS flows, which are the only managed identity flows in this package
+that talk to Entra directly; the other sources exchange tokens through a local endpoint that has no
+parameter to carry them. MSAL .NET applies the same restriction. When a call also passes
+`WithClaims`, the two are merged into the single `claims` parameter rather than one replacing the
+other.
+
+### Concurrency
+
+Token acquisitions are serialized process-wide. The managed identity endpoints are per-machine
+services with their own throttling, so a service taking a token per inbound request would otherwise
+fan out simultaneous requests on a cold cache and be answered with HTTP 429. The first caller
+populates the cache and the rest read it. MSAL .NET holds the same process-wide gate for the same
+reason.
+
 ### Requirements and errors
 
 Both options require Windows with Credential Guard/VBS enabled and a host whose IMDS serves the v2

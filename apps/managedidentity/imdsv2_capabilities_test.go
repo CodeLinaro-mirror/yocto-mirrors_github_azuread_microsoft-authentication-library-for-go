@@ -5,9 +5,16 @@ package managedidentity
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -514,7 +521,8 @@ func TestCapabilitiesReportsNoStrengthForAV1OnlyHostThatCannotBind(t *testing.T)
 
 // Narrowing the probe policy must not turn it into no policy. A 500 is still a
 // transient failure that says nothing about whether the host serves v2, so the
-// probe retries it exactly as an acquisition would.
+// probe retries it exactly as an acquisition would, and then asks the IMDSv1
+// question the way MSAL .NET does after any v2 probe failure.
 func TestCapabilitiesRetriesATransientProbeFailure(t *testing.T) {
 	withCleanCaches(t)
 	fake := newIMDSFake(t)
@@ -524,8 +532,82 @@ func TestCapabilitiesRetriesATransientProbeFailure(t *testing.T) {
 	if _, err := client.Capabilities(context.Background()); err != nil {
 		t.Fatalf("Capabilities: %v", err)
 	}
-	if got := strings.Join(fake.calls, ","); got != "metadata,metadata,metadata,metadata" {
-		t.Fatalf("calls = %q, want a 500 retried three times", got)
+	probes := 0
+	for _, call := range fake.calls {
+		if call != "metadata" {
+			break
+		}
+		probes++
+	}
+	if probes != 4 {
+		t.Fatalf("calls = %q, want a 500 retried three times before anything else", strings.Join(fake.calls, ","))
+	}
+	// .NET falls through to the v1 probe on any v2 failure, not only on a 404
+	// (ManagedIdentityClient.GetManagedIdentitySourceAsync).
+	if len(fake.calls) == probes {
+		t.Fatalf("calls = %q, want the v1 question asked after the v2 probe failed", strings.Join(fake.calls, ","))
+	}
+}
+
+// The probe's contract is the inverse of an acquisition's: it omits the
+// Metadata header precisely so a host that serves IMDSv2 rejects it, and that
+// rejection is the proof. MSAL .NET's probe is written the same way
+// (ImdsManagedIdentitySource.ProbeImdsEndpointAsync). A 200 therefore means
+// something other than IMDSv2 answered and is not success.
+func TestProbeOmitsMetadataHeaderAndAcceptsOnly400(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status    int
+		wantProbe bool
+	}{
+		"400 is the answer": {status: http.StatusBadRequest, wantProbe: true},
+		"200 is not":        {status: http.StatusOK, wantProbe: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			withCleanCaches(t)
+			var sawMetadataHeader bool
+			var probed bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "getplatformmetadata") {
+					probed = true
+					if r.Header.Get("Metadata") != "" {
+						sawMetadataHeader = true
+					}
+					w.WriteHeader(tc.status)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			t.Cleanup(srv.Close)
+			t.Setenv(identityEndpointEnvVar, "")
+			t.Setenv(msiEndpointEnvVar, "")
+			t.Setenv(identityHeaderEnvVar, "")
+			t.Setenv(imdsEndVar, "")
+			t.Setenv(msiSecretEnvVar, "")
+			t.Setenv(identityServerThumbprintEnvVar, "")
+			t.Setenv(azurePodIdentityAuthorityHostEnvVar, srv.URL)
+
+			client, err := New(SystemAssigned(), WithHTTPClient(srv.Client()), WithRetryPolicyDisabled())
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.keyProvider = newFakeKeyProvider()
+
+			capabilities, err := client.Capabilities(context.Background())
+			if err != nil {
+				t.Fatalf("Capabilities: %v", err)
+			}
+			if !probed {
+				t.Fatal("the probe never reached the metadata endpoint")
+			}
+			if sawMetadataHeader {
+				t.Fatal("the probe sent a Metadata header; .NET's omits it so the endpoint answers 400")
+			}
+			got := capabilities.MaxSupportedBindingStrength != MtlsBindingStrengthNone
+			if got != tc.wantProbe {
+				t.Fatalf("strength = %s, want a %t probe result for status %d",
+					capabilities.MaxSupportedBindingStrength, tc.wantProbe, tc.status)
+			}
+		})
 	}
 }
 
@@ -626,5 +708,206 @@ func TestProbeRetryPolicyDiffersFromAcquisitionOnlyOn404(t *testing.T) {
 	}
 	if !imdsRetriableStatus(http.StatusNotFound) {
 		t.Error("the acquisition path must still retry a 404")
+	}
+}
+
+// The Azure Arc agent installs its executable under Program Files; ProgramData
+// holds only its runtime state, which is where the token directory lives. MSAL
+// .NET probes %Programfiles%\AzureConnectedMachineAgent\himds.exe
+// (ManagedIdentityClient.WindowsHimdsFilePath), and a library looking in the
+// wrong directory reports no Azure Arc identity on a machine that has one.
+func TestAzureArcWindowsPathsMatchDotNet(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the Windows paths are only meaningful on Windows")
+	}
+	himds := getAzureArcHimdsFilePath("windows")
+	if want := filepath.Join(os.Getenv("ProgramFiles"), "AzureConnectedMachineAgent", "himds.exe"); himds != want {
+		t.Errorf("himds path = %q, want %q", himds, want)
+	}
+	// The token directory is genuinely under ProgramData in .NET too
+	// (ManagedIdentityClient.WindowsTokenPath). Only the executable moved.
+	tokens := getAzureArcPlatformPath("windows")
+	if want := filepath.Join(os.Getenv("ProgramData"), "AzureConnectedMachineAgent", "Tokens"); tokens != want {
+		t.Errorf("token path = %q, want %q", tokens, want)
+	}
+}
+
+// Client capabilities and a server-issued challenge share the token request's
+// single claims parameter, so they have to be merged rather than one dropped.
+func TestClientCapabilitiesReachTheTokenRequest(t *testing.T) {
+	for name, tc := range map[string]struct {
+		capabilities []string
+		claims       string
+		want         string
+	}{
+		"capabilities alone": {
+			capabilities: []string{"CP1"},
+			want:         `{"access_token":{"xms_cc":{"values":["CP1"]}}}`,
+		},
+		"capabilities merged with a challenge": {
+			capabilities: []string{"CP1"},
+			claims:       `{"access_token":{"nbf":{"essential":true,"value":"1701000000"}}}`,
+			want:         `{"access_token":{"nbf":{"essential":true,"value":"1701000000"},"xms_cc":{"values":["CP1"]}}}`,
+		},
+		"challenge alone is passed through": {
+			claims: `{"access_token":{"nbf":{"essential":true,"value":"1701000000"}}}`,
+			want:   `{"access_token":{"nbf":{"essential":true,"value":"1701000000"}}}`,
+		},
+		"neither sends nothing": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			withCleanCaches(t)
+			fake := newIMDSFake(t)
+			var opts []ClientOption
+			if len(tc.capabilities) > 0 {
+				opts = append(opts, WithClientCapabilities(tc.capabilities))
+			}
+			client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider(), opts...)
+
+			acquire := []AcquireTokenOption{WithMtlsProofOfPossession()}
+			if tc.claims != "" {
+				acquire = append(acquire, WithClaims(tc.claims))
+			}
+			if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", acquire...); err != nil {
+				t.Fatalf("AcquireToken: %v", err)
+			}
+			got := fake.lastTokenForm.Get("claims")
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("claims = %q, want the parameter omitted", got)
+				}
+				return
+			}
+			if !sameJSON(t, got, tc.want) {
+				t.Fatalf("claims = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func sameJSON(t *testing.T, a, b string) bool {
+	t.Helper()
+	var x, y any
+	if err := json.Unmarshal([]byte(a), &x); err != nil {
+		return false
+	}
+	if err := json.Unmarshal([]byte(b), &y); err != nil {
+		t.Fatalf("the expected value is not JSON: %v", err)
+	}
+	return reflect.DeepEqual(x, y)
+}
+// Concurrent acquisitions on a cold cache must not become concurrent requests
+// to the managed identity endpoint, which is a single per-machine service that
+// answers 429 when several arrive at once. MSAL .NET holds a process-wide
+// semaphore and re-reads the cache under it for exactly this reason
+// (ManagedIdentityAuthRequest.s_semaphoreSlim). Without the re-read every
+// waiter would go on to make the request the gate exists to prevent.
+func TestConcurrentAcquisitionsMakeOneRequest(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	const callers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession())
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	tokens := 0
+	for _, call := range fake.calls {
+		if call == "token" {
+			tokens++
+		}
+	}
+	if tokens != 1 {
+		t.Fatalf("calls = %q, want exactly one token request from %d concurrent callers", strings.Join(fake.calls, ","), callers)
+	}
+}
+
+// The gate must not outlive the caller's patience: a goroutine waiting for it
+// when its context is cancelled has to return rather than block until the
+// holder finishes.
+func TestTokenGateHonoursContextCancellation(t *testing.T) {
+	release, err := acquireMITokenGate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := acquireMITokenGate(ctx)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("the gate was acquired while another goroutine held it (err=%v)", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the waiter did not return after its context was cancelled")
+	}
+}
+
+// IMDS is not consistent about which error fields it fills, and the
+// correlationId it returns is the only handle a support engineer can use to
+// find the request in the service's logs. MSAL .NET reads all of these
+// (ManagedIdentityErrorResponse), so a Go caller filing the same incident has
+// the same identifier to quote.
+func TestIMDSErrorBodyFieldsAreReported(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want []string
+	}{
+		"oauth pair": {
+			body: `{"error":"invalid_request","error_description":"bad thing"}`,
+			want: []string{"invalid_request", "bad thing"},
+		},
+		"message only": {
+			body: `{"message":"identity not found"}`,
+			want: []string{"identity not found"},
+		},
+		"correlation id is appended": {
+			body: `{"error":"invalid_request","correlationId":"7f3c-abcd"}`,
+			want: []string{"invalid_request", "7f3c-abcd"},
+		},
+		"message with correlation id": {
+			body: `{"message":"identity not found","correlationId":"7f3c-abcd"}`,
+			want: []string{"identity not found", "7f3c-abcd"},
+		},
+		"non-json falls back to the raw body": {
+			body: "  plain text failure  ",
+			want: []string{"plain text failure"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := parseIMDSError([]byte(tc.body))
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("parseIMDSError(%q) = %q, want it to contain %q", tc.body, got, want)
+				}
+			}
+		})
 	}
 }
