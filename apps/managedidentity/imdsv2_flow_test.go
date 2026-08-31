@@ -14,11 +14,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -125,6 +127,14 @@ type imdsFake struct {
 	// lastAttestationToken is the attestation token carried by the most recent
 	// issue request, so a test can tell an attested request from a plain one.
 	lastAttestationToken string
+	// certLifetime is how long an issued binding certificate is valid for. It is
+	// settable so a test can drive the refresh window.
+	certLifetime time.Duration
+	// attestationEndpoint is what leg 1 advertises. It is settable so a test can
+	// prove a hostile value is rejected.
+	attestationEndpoint string
+	// metadataBody, when set, replaces the leg 1 response body verbatim.
+	metadataBody string
 }
 
 func newIMDSFake(t *testing.T) *imdsFake {
@@ -161,6 +171,9 @@ func newIMDSFake(t *testing.T) *imdsFake {
 		metadataStatus: http.StatusOK,
 		issueStatus:    http.StatusOK,
 		tokenType:      "mtls_pop",
+
+		certLifetime:        time.Hour,
+		attestationEndpoint: "https://attestation.example",
 	}
 
 	f.metadataServer = httptest.NewServer(http.HandlerFunc(f.handleMetadata))
@@ -207,6 +220,13 @@ func (f *imdsFake) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		f.handleIssue(w, r)
 		return
 	}
+	// An IMDSv1 token request carries a resource but no cred-api-version.
+	if r.URL.Query().Get("cred-api-version") == "" && r.URL.Query().Get("resource") != "" {
+		f.record("v1token")
+		f.writeServerHeader(w)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	f.record("metadata")
 	f.writeServerHeader(w)
 	if f.metadataStatus != http.StatusOK {
@@ -223,6 +243,10 @@ func (f *imdsFake) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if f.metadataBody != "" {
+		_, _ = w.Write([]byte(f.metadataBody))
+		return
+	}
 	// Real IMDS omits vmssId entirely on a standalone VM rather than sending it
 	// empty. The fixture matches a captured response: inventing a shape the
 	// service never sends is what let a bad CUID attribute reach production.
@@ -230,7 +254,7 @@ func (f *imdsFake) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		"cuId":                map[string]string{"vmId": "vm-1"},
 		"clientId":            f.clientID,
 		"tenantId":            f.tenantID,
-		"attestationEndpoint": "https://attestation.example",
+		"attestationEndpoint": f.attestationEndpoint,
 	})
 }
 
@@ -269,7 +293,7 @@ func (f *imdsFake) handleIssue(w http.ResponseWriter, r *http.Request) {
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject:      csr.Subject,
 		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotAfter:     time.Now().Add(f.certLifetime),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
@@ -1037,18 +1061,56 @@ func TestIMDSv2RejectsUnsupportedPlatform(t *testing.T) {
 
 func TestIMDSv2PlainAcquisitionIsUnaffected(t *testing.T) {
 	withCleanCaches(t)
-	fake := newIMDSFake(t)
-	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
 
-	// Without either option the client must keep using IMDSv1 and must not
-	// touch the certificate endpoints.
-	_, _ = client.AcquireToken(context.Background(), "https://vault.azure.net")
-	for _, c := range fake.calls {
-		if c == "issue" {
-			t.Fatal("a plain acquisition requested a binding certificate")
+	// The v1 endpoint is not redirectable by environment variable, so the
+	// request is intercepted at the transport instead. Recording it is what
+	// makes this test meaningful: asserting only that the v2 legs were skipped
+	// would also pass if the acquisition failed outright.
+	var requested []string
+	client, err := New(SystemAssigned(), WithHTTPClient(&http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			requested = append(requested, r.URL.String())
+			body := `{"access_token":"v1-access-token","token_type":"Bearer","expires_on":"` +
+				strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) +
+				`","resource":"https://vault.azure.net","client_id":"c"}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    r,
+			}, nil
+		}),
+	}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	result, err := client.AcquireToken(context.Background(), "https://vault.azure.net")
+	if err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+	if result.AccessToken != "v1-access-token" {
+		t.Fatalf("access token = %q, want the IMDSv1 token", result.AccessToken)
+	}
+	if result.BindingCertificate != nil {
+		t.Fatal("a plain acquisition returned a binding certificate")
+	}
+	if len(requested) != 1 {
+		t.Fatalf("requests = %v, want exactly one IMDSv1 token request", requested)
+	}
+	if !strings.Contains(requested[0], "api-version=2018-02-01") {
+		t.Fatalf("request = %q, want the IMDSv1 token endpoint", requested[0])
+	}
+	for _, url := range requested {
+		if strings.Contains(url, "cred-api-version") || strings.Contains(url, "issuecredential") {
+			t.Fatalf("a plain acquisition used an IMDSv2 endpoint: %s", url)
 		}
 	}
 }
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestIMDSv2SendsRequiredHeaders(t *testing.T) {
 	withCleanCaches(t)

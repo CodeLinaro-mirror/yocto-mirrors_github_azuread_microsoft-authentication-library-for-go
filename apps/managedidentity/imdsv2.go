@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"syscall"
 )
@@ -84,6 +85,34 @@ func (m csrMetadata) validate() error {
 		return fmt.Errorf("managedidentity: IMDS returned platform metadata without a vmId or vmssId")
 	}
 	return nil
+}
+
+// attestationURL returns the attestation endpoint to hand to the native
+// library. Legs 1 and 2 are plain HTTP and are not authenticated, so the value
+// is validated before use for the same reason [bindingCertificate.tokenEndpoint]
+// validates the token endpoint: a compromised or spoofed IMDS response must not
+// be able to redirect attestation to an endpoint of the attacker's choosing, or
+// downgrade it to plaintext. The native library fetches its own managed identity
+// token for this call, so the endpoint is a credential-bearing destination.
+func (m csrMetadata) attestationURL() (string, error) {
+	if m.AttestationEndpoint == "" {
+		return "", fmt.Errorf("managedidentity: attestation was requested but IMDS returned no attestationEndpoint")
+	}
+	raw := strings.TrimSuffix(m.AttestationEndpoint, "/")
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("managedidentity: IMDS returned an unusable attestation endpoint %q: %w", m.AttestationEndpoint, err)
+	}
+	if u.Scheme != "https" {
+		return "", fmt.Errorf("managedidentity: IMDS returned a non-https attestation endpoint %q", m.AttestationEndpoint)
+	}
+	if u.Hostname() == "" {
+		return "", fmt.Errorf("managedidentity: IMDS returned an attestation endpoint with no host %q", m.AttestationEndpoint)
+	}
+	return raw, nil
 }
 
 // certificateRequestBody is the /issuecredential request. AttestationToken is

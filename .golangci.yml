@@ -32,6 +32,14 @@ linters:
         linters:
           - gosec
         text: "G103"
+      # attestation_windows.go is the same case: the only way to call into
+      # AttestationClientLib.dll is to hand unsafe.Pointer values to
+      # syscall.SyscallN. Scoped to this one file so G103 still applies to the
+      # rest of the package, and every other gosec rule still applies here.
+      - path: apps/managedidentity/attestation_windows\.go
+        linters:
+          - gosec
+        text: "G103"
       # TODO: temporary suppressions to be addressed separately after the v2 upgrade.
       - linters:
           - gosec

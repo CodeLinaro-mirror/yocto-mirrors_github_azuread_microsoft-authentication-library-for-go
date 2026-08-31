@@ -6,9 +6,11 @@ package managedidentity
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/oauth/ops/accesstokens"
@@ -81,6 +83,13 @@ func (o AcquireTokenOptions) validate(source Source) error {
 		return ErrMtlsPoPAndBearerExclusive
 	}
 	if !o.usesIMDSv2() {
+		// Attestation applies to the binding key, which only the IMDSv2 path
+		// mints. Ignoring the option here would route the request to the
+		// ordinary bearer path and hand back a token with none of the
+		// protection the caller asked for.
+		if o.attestation {
+			return ErrAttestationRequiresMtls
+		}
 		return nil
 	}
 	// Only the IMDS source issues binding certificates. The other sources have
@@ -114,6 +123,9 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 	if err != nil {
 		return AuthResult{}, err
 	}
+	// binding is reassigned by the re-mint below, so the release reads the
+	// variable rather than capturing the first value.
+	defer func() { _ = binding.Close() }()
 
 	tr, err := requestEntraToken(ctx, c.mtlsClient(binding.TLS), binding, resource, o.mtlsPoP)
 	if err != nil {
@@ -121,10 +133,12 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 			return AuthResult{}, err
 		}
 		certCache.evict(key)
-		binding, _, err = v.getBindingCertificate(ctx, o.attestation)
+		reminted, _, err := v.getBindingCertificate(ctx, o.attestation)
 		if err != nil {
 			return AuthResult{}, err
 		}
+		_ = binding.Close()
+		binding = reminted
 		tr, err = requestEntraToken(ctx, c.mtlsClient(binding.TLS), binding, resource, o.mtlsPoP)
 		if err != nil {
 			return AuthResult{}, err
@@ -179,18 +193,36 @@ func (c Client) authResultForIMDSv2(tr accesstokens.TokenResponse, binding *bind
 }
 
 // copyBindingCertificate returns a certificate the caller can hold and mutate
-// without affecting the cached one. The DER chain is deep-copied because the
-// cached certificate is shared across concurrent acquisitions.
+// without affecting the cached one. The DER chain is deep-copied and the leaf is
+// re-parsed from that copy, so the result shares no backing array with the
+// cached certificate.
+//
+// The private key is necessarily the same object, because it is a handle to one
+// operating system key. The copy therefore takes a reference on the binding
+// certificate so that evicting the cache entry cannot release a key this
+// certificate still needs, and drops it once the caller lets the copy go.
 func copyBindingCertificate(binding *bindingCertificate) *tls.Certificate {
 	chain := make([][]byte, len(binding.TLS.Certificate))
 	for i, der := range binding.TLS.Certificate {
 		chain[i] = append([]byte(nil), der...)
 	}
-	return &tls.Certificate{
+	out := &tls.Certificate{
 		Certificate: chain,
 		PrivateKey:  binding.TLS.PrivateKey,
-		Leaf:        binding.Leaf,
 	}
+	if len(chain) > 0 {
+		if leaf, err := x509.ParseCertificate(chain[0]); err == nil {
+			out.Leaf = leaf
+		}
+	}
+	if out.Leaf == nil {
+		// The cached chain already parsed once, so this is unreachable in
+		// practice; sharing the cached leaf is still better than returning none.
+		out.Leaf = binding.Leaf
+	}
+	binding.retain()
+	runtime.SetFinalizer(out, func(*tls.Certificate) { _ = binding.Close() })
+	return out
 }
 
 // mtlsClient builds the client used for the IMDSv2 token leg, honouring

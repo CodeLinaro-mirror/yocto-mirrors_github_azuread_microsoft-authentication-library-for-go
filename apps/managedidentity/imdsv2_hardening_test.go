@@ -1,0 +1,525 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package managedidentity
+
+import (
+	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"errors"
+	"io"
+	"math/big"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// revocableSigner is a software key whose handle can be released, the way a CNG
+// handle is. Signing after the release fails, which is what makes a
+// use-after-close observable in a test that has no KeyGuard available.
+type revocableSigner struct {
+	key    *rsa.PrivateKey
+	mu     sync.Mutex
+	closed bool
+}
+
+func (r *revocableSigner) Public() crypto.PublicKey { return r.key.Public() }
+
+func (r *revocableSigner) Sign(rnd io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if closed {
+		return nil, errors.New("key handle is closed")
+	}
+	return r.key.Sign(rnd, digest, opts)
+}
+
+func (r *revocableSigner) close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closed = true
+	return nil
+}
+
+// revocableKeyProvider hands out revocableSigner handles over one key.
+type revocableKeyProvider struct {
+	mu  sync.Mutex
+	key *rsa.PrivateKey
+}
+
+func (p *revocableKeyProvider) getOrCreateKey(string) (bindingKey, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.key == nil {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			return bindingKey{}, err
+		}
+		p.key = key
+	}
+	signer := &revocableSigner{key: p.key}
+	return bindingKey{Signer: signer, Type: keyTypeKeyGuard, Close: signer.close}, nil
+}
+
+func (p *revocableKeyProvider) deleteKey(string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.key = nil
+	return nil
+}
+
+// countCalls reports how many times the fake saw a given leg.
+func (f *imdsFake) countCalls(path string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if c == path {
+			n++
+		}
+	}
+	return n
+}
+
+func TestIMDSv2AttestationWithoutMtlsIsRejected(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	attempts := withStubAttestation(t, "token", nil)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	// Attestation only means something on the mTLS path. Asking for it on a
+	// plain bearer request used to be silently ignored, which handed back a
+	// credential with fewer guarantees than the caller asked for.
+	_, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithAttestationSupport())
+	if !errors.Is(err, ErrAttestationRequiresMtls) {
+		t.Fatalf("error = %v, want ErrAttestationRequiresMtls", err)
+	}
+	if fake.callCount() != 0 {
+		t.Fatal("an invalid option combination reached the network")
+	}
+	if *attempts != 0 {
+		t.Fatal("attestation was attempted for a request that could not carry it")
+	}
+}
+
+func TestIMDSv2AttestationIsAcceptedWithBearerOverMtls(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.tokenType = "Bearer"
+	attempts := withStubAttestation(t, stubAttestationJWT(t, time.Now().Add(time.Hour)), nil)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	// WithRequestOverMtls still runs the certificate-authenticated exchange, so
+	// attestation is meaningful there and must not be rejected.
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net",
+		WithRequestOverMtls(), WithAttestationSupport()); err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+	if *attempts != 1 {
+		t.Fatalf("attestation attempts = %d, want 1", *attempts)
+	}
+	if fake.lastAttestationToken == "" {
+		t.Fatal("the issue request carried no attestation token")
+	}
+}
+
+func TestIMDSv2BearerOverMtlsReturnsNoBindingCertificate(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.tokenType = "Bearer"
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	result, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithRequestOverMtls())
+	if err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+	// The token is not bound to the certificate, so the caller has nothing to
+	// present and is given nothing to present. This pins the documented
+	// contract, which previously disagreed with the code.
+	if result.BindingCertificate != nil {
+		t.Fatal("a bearer-over-mTLS acquisition returned a binding certificate")
+	}
+}
+
+func TestIMDSv2BindingCertificateOutlivesCacheEviction(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	client := fake.newTestClient(t, SystemAssigned(), &revocableKeyProvider{})
+
+	result, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession())
+	if err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+	if result.BindingCertificate == nil {
+		t.Fatal("no binding certificate was returned")
+	}
+	signer, ok := result.BindingCertificate.PrivateKey.(crypto.Signer)
+	if !ok {
+		t.Fatal("the binding certificate's private key is not a signer")
+	}
+
+	// Anything that drops the cache entry releases the cache's reference to the
+	// key. The certificate already handed to the caller must keep working: it is
+	// what they present on the TLS handshake to the resource, and that handshake
+	// can happen long after a re-mint or an identity change evicted the entry.
+	certCache.clear()
+
+	digest := sha256.Sum256([]byte("payload the caller signs after eviction"))
+	if _, err := signer.Sign(rand.Reader, digest[:], crypto.SHA256); err != nil {
+		t.Fatalf("signing with the returned certificate failed after the cache was evicted: %v", err)
+	}
+}
+
+func TestIMDSv2SeparateIdentitiesGetSeparateCertificates(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	provider := newFakeKeyProvider()
+
+	first := fake.newTestClient(t, UserAssignedClientID("11111111-1111-1111-1111-111111111111"), provider)
+	firstResult, err := first.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession())
+	if err != nil {
+		t.Fatalf("first AcquireToken: %v", err)
+	}
+
+	second := fake.newTestClient(t, UserAssignedClientID("22222222-2222-2222-2222-222222222222"), provider)
+	fake.resetCalls()
+	secondResult, err := second.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession())
+	if err != nil {
+		t.Fatalf("second AcquireToken: %v", err)
+	}
+
+	// A second identity must mint its own certificate rather than be served the
+	// first identity's, which would let one identity present a credential
+	// issued for another.
+	if got := strings.Join(fake.calls, ","); got != "metadata,issue,token" {
+		t.Fatalf("call sequence = %q, want a second identity to get its own certificate", got)
+	}
+	if firstResult.BindingCertificate == nil || secondResult.BindingCertificate == nil {
+		t.Fatal("a binding certificate was missing")
+	}
+	if string(firstResult.BindingCertificate.Certificate[0]) == string(secondResult.BindingCertificate.Certificate[0]) {
+		t.Fatal("two identities were handed the same binding certificate")
+	}
+
+	// The first identity's certificate must still be cached and reusable.
+	fake.resetCalls()
+	if _, err := first.AcquireToken(context.Background(), "https://storage.azure.com", WithMtlsProofOfPossession()); err != nil {
+		t.Fatalf("third AcquireToken: %v", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "metadata,token" {
+		t.Fatalf("call sequence = %q, want the first identity's certificate to be reused", got)
+	}
+}
+
+func TestIMDSv2ReissuesCertificateNearingExpiry(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	// Well inside bindingCertRefreshWindow, so the certificate is already too
+	// close to expiry to be worth presenting.
+	fake.certLifetime = time.Minute
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession()); err != nil {
+		t.Fatalf("first AcquireToken: %v", err)
+	}
+
+	fake.resetCalls()
+	if _, err := client.AcquireToken(context.Background(), "https://storage.azure.com", WithMtlsProofOfPossession()); err != nil {
+		t.Fatalf("second AcquireToken: %v", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "metadata,issue,token" {
+		t.Fatalf("call sequence = %q, want a certificate near expiry to be re-minted", got)
+	}
+}
+
+func TestIMDSv2ReusesCertificateOutsideRefreshWindow(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.certLifetime = time.Hour
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession()); err != nil {
+		t.Fatalf("first AcquireToken: %v", err)
+	}
+
+	// The mirror of the test above: a certificate comfortably inside its
+	// lifetime must not be re-minted, or every acquisition pays for issuance.
+	fake.resetCalls()
+	if _, err := client.AcquireToken(context.Background(), "https://storage.azure.com", WithMtlsProofOfPossession()); err != nil {
+		t.Fatalf("second AcquireToken: %v", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "metadata,token" {
+		t.Fatalf("call sequence = %q, want a healthy certificate to be reused", got)
+	}
+}
+
+func TestIMDSv2CachedTokenIsNotServedWithAnOrphanedCertificate(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	provider := newFakeKeyProvider()
+	client := fake.newTestClient(t, SystemAssigned(), provider)
+
+	const resource = "https://vault.azure.net"
+	if _, err := client.AcquireToken(context.Background(), resource, WithMtlsProofOfPossession()); err != nil {
+		t.Fatalf("first AcquireToken: %v", err)
+	}
+
+	// The isolated container was recreated, so the cached certificate no longer
+	// matches the key. Asking for the same resource takes the cached-token fast
+	// path, which must still notice: handing back a bound token with a
+	// certificate whose key is gone fails later, in the caller's TLS handshake
+	// against the resource, where it is very hard to attribute.
+	provider.rotate(t, bindingKeyName)
+
+	fake.resetCalls()
+	result, err := client.AcquireToken(context.Background(), resource, WithMtlsProofOfPossession())
+	if err != nil {
+		t.Fatalf("second AcquireToken: %v", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "metadata,issue,token" {
+		t.Fatalf("call sequence = %q, want the orphaned certificate to be replaced", got)
+	}
+	if result.BindingCertificate == nil {
+		t.Fatal("no binding certificate was returned")
+	}
+	current, err := provider.getOrCreateKey(bindingKeyName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = current.Close() }()
+	if err := certificateMatchesKey(result.BindingCertificate.Leaf, current); err != nil {
+		t.Fatalf("the returned certificate does not match the current key: %v", err)
+	}
+}
+
+func TestIMDSv2ConcurrentAcquisitionsMintOneCertificate(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = client.AcquireToken(context.Background(),
+				"https://vault.azure.net", WithMtlsProofOfPossession())
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+	// Issuance is serialized because concurrent callers would otherwise each
+	// mint a key into the same container and invalidate each other's
+	// certificate. Run under -race to also cover the cache mutexes.
+	if got := fake.countCalls("issue"); got != 1 {
+		t.Fatalf("issue requests = %d, want exactly 1", got)
+	}
+}
+
+func TestIMDSv2ConcurrentAttestedAndPlainAcquisitions(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	withStubAttestation(t, stubAttestationJWT(t, time.Now().Add(time.Hour)), nil)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	for i := 0; i < len(errs); i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			opts := []AcquireTokenOption{WithMtlsProofOfPossession()}
+			if i%2 == 0 {
+				opts = append(opts, WithAttestationSupport())
+			}
+			_, errs[i] = client.AcquireToken(context.Background(), "https://vault.azure.net", opts...)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+	// The attested and non-attested certificates live in separate cache
+	// partitions, so exactly two are minted no matter how the calls interleave.
+	if got := fake.countCalls("issue"); got != 2 {
+		t.Fatalf("issue requests = %d, want one per cache partition", got)
+	}
+}
+
+func TestIMDSv2RejectsHostileAttestationEndpoint(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		endpoint string
+		want     string
+	}{
+		{"plaintext", "http://attacker.example", "non-https"},
+		{"scheme relative", "//attacker.example", "no host"},
+		{"no host", "https:///path", "no host"},
+		{"empty", "", "no attestationEndpoint"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			withCleanCaches(t)
+			fake := newIMDSFake(t)
+			fake.attestationEndpoint = test.endpoint
+			attempts := withStubAttestation(t, "token", nil)
+			client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+			// Legs 1 and 2 are unauthenticated plain HTTP, so the endpoint is
+			// attacker-influenceable. The native library fetches a managed
+			// identity token for this call, so following an arbitrary endpoint
+			// would hand that token to whoever answered.
+			_, err := client.AcquireToken(context.Background(), "https://vault.azure.net",
+				WithMtlsProofOfPossession(), WithAttestationSupport())
+			if err == nil {
+				t.Fatal("a hostile attestation endpoint was accepted")
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want it to mention %q", err, test.want)
+			}
+			if *attempts != 0 {
+				t.Fatal("attestation was attempted against an unvalidated endpoint")
+			}
+		})
+	}
+}
+
+func TestIMDSv2AcceptsBareHostAttestationEndpoint(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	// IMDS has been observed returning a bare host. That is not a downgrade, so
+	// it is accepted and normalized to https rather than rejected.
+	fake.attestationEndpoint = "attestation.example"
+	var seen string
+	original := attestKeyGuardFn
+	attestKeyGuardFn = func(endpoint, clientID string, key bindingKey) (string, error) {
+		seen = endpoint
+		return stubAttestationJWT(t, time.Now().Add(time.Hour)), nil
+	}
+	t.Cleanup(func() { attestKeyGuardFn = original })
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net",
+		WithMtlsProofOfPossession(), WithAttestationSupport()); err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+	if seen != "https://attestation.example" {
+		t.Fatalf("attestation endpoint = %q, want it normalized to https", seen)
+	}
+}
+
+func TestIMDSv2RejectsMalformedMetadata(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{"not json", `{"cuId":`, "parsing platform metadata"},
+		{"no client id", `{"cuId":{"vmId":"vm-1"},"tenantId":"t"}`, "clientId"},
+		{"no tenant id", `{"cuId":{"vmId":"vm-1"},"clientId":"c"}`, "tenantId"},
+		{"no cuid", `{"clientId":"c","tenantId":"t"}`, "vmId"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			withCleanCaches(t)
+			fake := newIMDSFake(t)
+			fake.metadataBody = test.body
+			client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+			_, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession())
+			if err == nil {
+				t.Fatal("malformed platform metadata was accepted")
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want it to mention %q", err, test.want)
+			}
+			if fake.countCalls("issue") != 0 {
+				t.Fatal("a certificate was requested from malformed metadata")
+			}
+		})
+	}
+}
+
+func TestIMDSv2PropagatesContextCancellation(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.AcquireToken(ctx, "https://vault.azure.net", WithMtlsProofOfPossession())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if fake.countCalls("issue") != 0 {
+		t.Fatal("a certificate was requested on a cancelled context")
+	}
+}
+
+func TestIMDSv2ReportsUnreachableMetadataService(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+	// The service is gone, which is what a host without IMDS looks like.
+	fake.metadataServer.Close()
+
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession()); err == nil {
+		t.Fatal("an unreachable metadata service produced a token")
+	}
+}
+
+func TestIMDSv2ReusesOneHTTPClientPerCertificate(t *testing.T) {
+	cert := selfSignedTLSCertificate(t)
+	first := mtlsHTTPClient(cert)
+	again := mtlsHTTPClient(cert)
+	// A fresh client per acquisition strands an idle TLS connection for the
+	// transport's idle timeout on every token request.
+	if first != again {
+		t.Fatal("the same certificate produced two clients")
+	}
+
+	third := mtlsHTTPClient(selfSignedTLSCertificate(t))
+	if third == first {
+		t.Fatal("a different certificate reused the previous client, so a pooled connection could carry the wrong certificate")
+	}
+}
+
+func selfSignedTLSCertificate(t *testing.T) tls.Certificate {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "mtls-client-cache-test"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+	return cert
+}

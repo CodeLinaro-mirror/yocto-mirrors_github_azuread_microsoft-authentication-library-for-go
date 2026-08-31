@@ -421,17 +421,30 @@ _ = result.Metadata.TokenType   // "mtls_pop"
 _ = result.BindingCertificate   // the certificate the token is bound to
 ```
 
+`BindingCertificate` is non-nil only for the two mTLS options below. It is `nil` for an ordinary
+managed identity call, so guard it before dereferencing.
+
 ### Calling the resource
 
 An `mtls_pop` token is only accepted when the same certificate is presented on the TLS handshake.
 Drop `result.BindingCertificate` into the transport and send the token with the `mtls_pop` scheme:
 
 ```go
+cert := *result.BindingCertificate
 httpClient := &http.Client{
     Transport: &http.Transport{
         TLSClientConfig: &tls.Config{
-            Certificates: []tls.Certificate{*result.BindingCertificate},
-            MinVersion:   tls.VersionTLS12,
+            GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+                return &cert, nil
+            },
+            MinVersion: tls.VersionTLS12,
+            // Azure resources that enforce token binding ask for the client
+            // certificate by TLS renegotiation, after they have read the
+            // request. Go refuses renegotiation by default and TLS 1.3 has no
+            // post-handshake client auth in crypto/tls, so without these two
+            // settings the connection is reset instead of authenticated.
+            MaxVersion:    tls.VersionTLS12,
+            Renegotiation: tls.RenegotiateOnceAsClient,
         },
     },
 }
@@ -442,6 +455,10 @@ req.Header.Set("x-ms-tokenboundauth", "true")
 resp, err := httpClient.Do(req)
 ```
 
+`GetClientCertificate` is used rather than `Certificates` because the certificate must still be
+offered on the renegotiated handshake. Reuse one client across calls so the connection — and the
+certificate bound to it — is pooled.
+
 Sending the token as `Bearer`, or over a connection without the certificate, is rejected by a
 resource that enforces token binding — that is the point of the feature.
 
@@ -449,10 +466,38 @@ resource that enforces token binding — that is the point of the feature.
 
 `WithRequestOverMtls()` performs the same certificate-authenticated exchange but asks for an
 **ordinary bearer token**. Use it when you want the hardened credential path without requiring the
-resource to understand `mtls_pop`; nothing changes for the resource. `result.BindingCertificate` is
-still returned so you can reuse the connection, but the token is not bound to it.
+resource to understand `mtls_pop`; nothing changes for the resource. Because the token is not bound
+to the certificate, `result.BindingCertificate` is `nil` — the caller does not need to present
+anything to spend the token.
 
 The two options are mutually exclusive; combining them returns `ErrMtlsPoPAndBearerExclusive`.
+
+### Attestation
+
+`WithAttestationSupport()` asks IMDS to attest the binding key before it issues a certificate, so
+the certificate carries proof that the private key lives in a KeyGuard trustlet. Use it when the
+resource requires an attested credential:
+
+```go
+result, err := client.AcquireToken(ctx, scope,
+    managedidentity.WithMtlsProofOfPossession(),
+    managedidentity.WithAttestationSupport(),
+)
+```
+
+Attestation needs `AttestationClientLib.dll`, a native Windows component published in the
+`Microsoft.Azure.Security.KeyGuardAttestation` package under `runtimes/win-x64/native`. It is not
+part of this module — deploy it next to the host executable or install it into `System32`. Those are
+the only two locations searched. MSAL .NET has the same deployment requirement; it just gets the
+file automatically through NuGet's native-asset convention, which Go has no equivalent for.
+
+Without the option nothing is attested and the credential request goes out non-attested, matching
+MSAL .NET when its optional `Microsoft.Identity.Client.KeyAttestation` package is not referenced.
+With it, a failure to attest is an **error, not a downgrade** — a caller that asked for attestation
+is never silently given a credential that lacks it.
+
+Attested and non-attested certificates are cached separately, so opting in never reuses a
+certificate that was issued without attestation.
 
 ### Requirements and errors
 
@@ -467,6 +512,8 @@ hosts. Failures are typed so you can branch on them with `errors.Is`:
 | `ErrMtlsPoPNotSupportedInIMDSv1` | The host serves IMDSv1 only. There is **no silent downgrade** to an unbound token. |
 | `ErrMtlsPoPNotSupportedForSource` | The identity source (App Service, Cloud Shell, Azure Arc, …) has no v2 credential endpoint. |
 | `ErrMtlsPoPAndBearerExclusive` | `WithMtlsProofOfPossession()` and `WithRequestOverMtls()` were both set. |
+| `ErrAttestationRequiresMtls` | `WithAttestationSupport()` was set without one of the two mTLS options, where it would have no effect. |
+| `ErrAttestationUnavailable` | Attestation was requested but `AttestationClientLib.dll` could not be loaded. |
 
 Notes:
 
@@ -481,6 +528,8 @@ Notes:
   object ID, or resource ID.
 
 
+
+## Community Help and Support
 
 We use [Stack Overflow](http://stackoverflow.com/questions/tagged/msal) to work with the community on supporting Azure Active Directory and its SDKs, including this one! We highly recommend you ask your questions on Stack Overflow (we're all on there!) Also browse existing issues to see if someone has had your question before. Please use the "msal" tag when asking your questions.
 

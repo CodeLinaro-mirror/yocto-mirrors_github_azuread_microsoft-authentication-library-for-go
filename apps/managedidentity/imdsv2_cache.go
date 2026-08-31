@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // certCacheEntry is a cached binding certificate together with the key that
@@ -68,7 +69,9 @@ func identityKey(id ID) string {
 	}
 }
 
-// get returns a cached certificate if one is present and still usable.
+// get returns a cached certificate if one is present and still usable. The
+// returned certificate carries a reference the caller must release with Close,
+// so that a concurrent evict cannot release the key while it is in use.
 func (c *bindingCertCache) get(key string) (*bindingCertificate, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -76,6 +79,7 @@ func (c *bindingCertCache) get(key string) (*bindingCertificate, bool) {
 	if !ok {
 		return nil, false
 	}
+	entry.cert.retain()
 	return entry.cert, true
 }
 
@@ -119,8 +123,26 @@ func isOrphaned(cert *bindingCertificate, provider keyProvider) bool {
 	return certificateMatchesKey(cert.Leaf, current) != nil
 }
 
+// bindingCertRefreshWindow is how long before its expiry a cached binding
+// certificate stops being reused. Presenting a certificate that expires mid
+// request costs a wasted mTLS round trip and surfaces as an opaque rejection
+// from Entra, so it is re-minted slightly early instead.
+const bindingCertRefreshWindow = 5 * time.Minute
+
+// needsRefresh reports whether a cached certificate is at or past its refresh
+// window and should be re-minted rather than reused.
+func needsRefresh(cert *bindingCertificate) bool {
+	if cert == nil || cert.Leaf == nil || cert.Leaf.NotAfter.IsZero() {
+		return false
+	}
+	return !cert.Leaf.NotAfter.After(now().Add(bindingCertRefreshWindow))
+}
+
 // getBindingCertificate returns a binding certificate for the identity IMDS
 // reports, issuing a new one only when the cache cannot supply a usable one.
+//
+// The returned certificate carries a reference the caller must release with
+// Close.
 func (v imdsV2) getBindingCertificate(ctx context.Context, attested bool) (*bindingCertificate, string, error) {
 	if !platformSupportsMtlsPoP() {
 		return nil, "", ErrMtlsNotSupportedForPlatform
@@ -143,8 +165,11 @@ func (v imdsV2) getBindingCertificate(ctx context.Context, attested bool) (*bind
 	defer certCache.mu.Unlock()
 
 	if entry, ok := certCache.entries[key]; ok {
-		reusable := entry.cert.ClientID == metadata.ClientID && !isOrphaned(entry.cert, v.keyProvider)
+		reusable := entry.cert.ClientID == metadata.ClientID &&
+			!needsRefresh(entry.cert) &&
+			!isOrphaned(entry.cert, v.keyProvider)
 		if reusable {
+			entry.cert.retain()
 			return entry.cert, key, nil
 		}
 		_ = entry.cert.Close()
@@ -155,7 +180,10 @@ func (v imdsV2) getBindingCertificate(ctx context.Context, attested bool) (*bind
 	if err != nil {
 		return nil, "", err
 	}
+	// The cache takes over the reference newBindingCertificate created; the
+	// caller gets one of its own.
 	certCache.entries[key] = &certCacheEntry{cert: cert}
+	cert.retain()
 	return cert, key, nil
 }
 
@@ -191,7 +219,12 @@ func (v imdsV2) issueBindingCertificate(ctx context.Context, correlationID strin
 	// fewer guarantees than the one requested.
 	var attestationToken string
 	if attested {
-		attestationToken, err = attestKeyGuardCached(metadata.AttestationEndpoint, metadata.ClientID, key)
+		endpoint, err := metadata.attestationURL()
+		if err != nil {
+			_ = key.Close()
+			return nil, err
+		}
+		attestationToken, err = attestKeyGuardCached(endpoint, metadata.ClientID, key)
 		if err != nil {
 			_ = key.Close()
 			return nil, err

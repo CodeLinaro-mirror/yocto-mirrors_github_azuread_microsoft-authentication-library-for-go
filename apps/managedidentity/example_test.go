@@ -46,11 +46,23 @@ func ExampleWithMtlsProofOfPossession_callingTheResource() {
 		log.Fatal(err)
 	}
 
+	cert := *result.BindingCertificate
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				Certificates: []tls.Certificate{*result.BindingCertificate},
-				MinVersion:   tls.VersionTLS12,
+				// GetClientCertificate rather than Certificates: the certificate has to
+				// be offered again on the renegotiated handshake, not just the first one.
+				GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+					return &cert, nil
+				},
+				MinVersion: tls.VersionTLS12,
+				// Azure resources that enforce token binding ask for the client
+				// certificate by TLS renegotiation, after reading the request. Go
+				// refuses renegotiation by default, and TLS 1.3 has no post-handshake
+				// client auth in crypto/tls, so without these two settings the
+				// connection is reset instead of authenticated.
+				MaxVersion:    tls.VersionTLS12,
+				Renegotiation: tls.RenegotiateOnceAsClient,
 			},
 		},
 	}

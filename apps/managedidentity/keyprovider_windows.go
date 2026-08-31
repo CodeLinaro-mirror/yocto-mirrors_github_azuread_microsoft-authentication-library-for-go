@@ -299,6 +299,21 @@ func keyCanSign(key windows.Handle) bool {
 		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
 		0, 0, uintptr(unsafe.Pointer(&needed)), bcryptPadPKCS1Flag|ncryptSilentFlag,
 	)
+	if status != 0 || needed == 0 {
+		return false
+	}
+	// The call above only asks how large a signature would be, which CNG answers
+	// from the key's public metadata. That metadata is exactly what survives the
+	// reboot, so the size query alone cannot distinguish a live key from a
+	// stranded one. Producing a real signature is what exercises the isolated
+	// private material.
+	signature := make([]byte, needed)
+	status, _, _ = syscall.SyscallN(procNCryptSignHash.Addr(),
+		uintptr(key), uintptr(unsafe.Pointer(&padInfo)),
+		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
+		uintptr(unsafe.Pointer(&signature[0])), uintptr(len(signature)),
+		uintptr(unsafe.Pointer(&needed)), bcryptPadPKCS1Flag|ncryptSilentFlag,
+	)
 	return status == 0
 }
 

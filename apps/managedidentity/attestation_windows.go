@@ -5,6 +5,8 @@ package managedidentity
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -14,10 +16,23 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// attestationLibName is loaded through the standard search order rather than a
-// fixed path: the module cannot redistribute it, so it is found next to the
-// host executable or wherever the deployment put it.
+// attestationLibName is resolved only from the directory holding the host
+// executable, any directory the process added with AddDllDirectory, and
+// System32. It is deliberately not loaded through the standard search order,
+// which would also search the current working directory and every PATH entry
+// and would let any principal able to write to one of those load arbitrary
+// native code into a process that holds managed identity tokens and a live
+// KeyGuard key handle.
 const attestationLibName = "AttestationClientLib.dll"
+
+// LoadLibraryEx search flags. Passing any LOAD_LIBRARY_SEARCH_* flag replaces
+// the standard search order with the restricted set named by the flags, so
+// neither the working directory nor PATH is consulted.
+const (
+	loadLibrarySearchApplicationDir = 0x00000200
+	loadLibrarySearchSystem32       = 0x00000800
+	loadLibrarySearchDefaultDirs    = 0x00001000
+)
 
 // attestationLogInfo mirrors the AttestationLogInfo struct the native library
 // expects: a callback and an opaque context pointer.
@@ -29,13 +44,9 @@ type attestationLogInfo struct {
 // nativeLogLevel values as the native library defines them.
 var nativeLogLevels = [...]string{"error", "warn", "info", "debug"}
 
-// procSearchPathW locates a module on the loader search path without loading
-// it. x/sys/windows does not expose SearchPath, so it is bound here.
-var procSearchPathW = windows.NewLazySystemDLL("kernel32.dll").NewProc("SearchPathW")
-
 type attestationLib struct {
-	attestKeyGuardImportKey *windows.LazyProc
-	freeAttestationToken    *windows.LazyProc
+	attestKeyGuardImportKey uintptr
+	freeAttestationToken    uintptr
 }
 
 var (
@@ -75,14 +86,16 @@ func drainAttestationLog() []string {
 // a pointer, which is both unsafe and something go vet correctly rejects.
 func attestationLogThunk(ctx uintptr, tag *byte, level uintptr, function *byte, line uintptr, message *byte) uintptr {
 	levelName := "unknown"
-	if int32(level) >= 0 && int(int32(level)) < len(nativeLogLevels) {
-		levelName = nativeLogLevels[int32(level)]
+	// level is unsigned, so a bounds check alone is enough; converting to a
+	// signed type here would be a needless narrowing.
+	if level < uintptr(len(nativeLogLevels)) {
+		levelName = nativeLogLevels[level]
 	}
 	recordAttestationLog(fmt.Sprintf("[%s] %s %s:%d %s",
 		levelName,
 		windows.BytePtrToString(tag),
 		windows.BytePtrToString(function),
-		int32(line),
+		line,
 		windows.BytePtrToString(message)))
 	return 0
 }
@@ -93,8 +106,9 @@ func attestationLogThunk(ctx uintptr, tag *byte, level uintptr, function *byte, 
 // produces a real error.
 func loadAttestationLib() (*attestationLib, error) {
 	attestationLibOnce.Do(func() {
-		dll := windows.NewLazyDLL(attestationLibName)
-		if err := dll.Load(); err != nil {
+		handle, err := windows.LoadLibraryEx(attestationLibName, 0,
+			loadLibrarySearchApplicationDir|loadLibrarySearchSystem32|loadLibrarySearchDefaultDirs)
+		if err != nil {
 			// A failed load reports ERROR_MOD_NOT_FOUND whether the library
 			// itself is absent or one of its own dependencies is, so the error
 			// alone cannot tell a host that never deployed it from a host that
@@ -109,18 +123,28 @@ func loadAttestationLib() (*attestationLib, error) {
 			attestationLibErr = fmt.Errorf("%w: loading %s: %v", ErrAttestationUnavailable, attestationLibName, err)
 			return
 		}
-		initLib := dll.NewProc("InitAttestationLib")
-		attest := dll.NewProc("AttestKeyGuardImportKey")
-		free := dll.NewProc("FreeAttestationToken")
-		for _, p := range []*windows.LazyProc{initLib, attest, free} {
-			if err := p.Find(); err != nil {
-				attestationLibErr = fmt.Errorf("%w: %s is missing %s: %v", ErrAttestationUnavailable, attestationLibName, p.Name, err)
+		var initLib, attest, free uintptr
+		for _, p := range []struct {
+			name string
+			addr *uintptr
+		}{
+			{"InitAttestationLib", &initLib},
+			{"AttestKeyGuardImportKey", &attest},
+			{"FreeAttestationToken", &free},
+		} {
+			addr, err := windows.GetProcAddress(handle, p.name)
+			if err != nil {
+				attestationLibErr = fmt.Errorf("%w: %s is missing %s: %v", ErrAttestationUnavailable, attestationLibName, p.name, err)
 				return
 			}
+			*p.addr = addr
 		}
 
 		info := attestationLogInfo{log: windows.NewCallback(attestationLogThunk)}
-		if r, _, err := syscall.SyscallN(initLib.Addr(), uintptr(unsafe.Pointer(&info))); r != 0 {
+		if r, _, err := syscall.SyscallN(initLib, uintptr(unsafe.Pointer(&info))); r != 0 {
+			// #nosec G115 -- the native library returns a 32-bit HRESULT-style
+			// status widened into a uintptr by the syscall ABI, so narrowing it
+			// back to int32 restores the value the library actually returned.
 			attestationLibErr = fmt.Errorf("managedidentity: InitAttestationLib returned %d: %v", int32(r), err)
 			return
 		}
@@ -133,38 +157,25 @@ func loadAttestationLib() (*attestationLib, error) {
 	return attestationLibVal, attestationLibErr
 }
 
-// findAttestationLib locates the library on the loader search path without
-// loading it, so a load failure caused by a missing dependency can be told
-// apart from the library simply not being deployed.
+// findAttestationLib reports where the library is deployed, so a load failure
+// caused by a missing dependency can be told apart from the library simply not
+// being deployed. It checks exactly the directories loadAttestationLib is
+// willing to load from, so a file found here is one that would have loaded.
 func findAttestationLib() (string, error) {
-	name, err := windows.UTF16PtrFromString(attestationLibName)
-	if err != nil {
-		return "", err
+	var dirs []string
+	if exe, err := os.Executable(); err == nil {
+		dirs = append(dirs, filepath.Dir(exe))
 	}
-	buf := make([]uint16, windows.MAX_PATH)
-	n, _, err := syscall.SyscallN(procSearchPathW.Addr(),
-		0,
-		uintptr(unsafe.Pointer(name)),
-		0,
-		uintptr(len(buf)),
-		uintptr(unsafe.Pointer(&buf[0])),
-		0)
-	if n == 0 {
-		return "", err
+	if sys, err := windows.GetSystemDirectory(); err == nil {
+		dirs = append(dirs, sys)
 	}
-	if n > uintptr(len(buf)) {
-		buf = make([]uint16, n)
-		if n, _, err = syscall.SyscallN(procSearchPathW.Addr(),
-			0,
-			uintptr(unsafe.Pointer(name)),
-			0,
-			uintptr(len(buf)),
-			uintptr(unsafe.Pointer(&buf[0])),
-			0); n == 0 {
-			return "", err
+	for _, dir := range dirs {
+		path := filepath.Join(dir, attestationLibName)
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
 		}
 	}
-	return windows.UTF16ToString(buf), nil
+	return "", fmt.Errorf("%s was not found in the application directory or System32", attestationLibName)
 }
 
 // attestKeyGuard asks the native library for an MAA statement over key. It
@@ -211,7 +222,7 @@ func attestKeyGuard(endpoint, clientID string, key bindingKey) (string, error) {
 	var token *byte
 	// authToken and clientPayload are null: the library fetches its own managed
 	// identity token from IMDS, which is what MSAL .NET passes too.
-	r, _, callErr := syscall.SyscallN(lib.attestKeyGuardImportKey.Addr(),
+	r, _, callErr := syscall.SyscallN(lib.attestKeyGuardImportKey,
 		uintptr(unsafe.Pointer(endpointPtr)),
 		0,
 		0,
@@ -223,6 +234,9 @@ func attestKeyGuard(endpoint, clientID string, key bindingKey) (string, error) {
 	runtime.KeepAlive(endpointPtr)
 	runtime.KeepAlive(clientIDPtr)
 
+	// #nosec G115 -- the native library returns a 32-bit status widened into a
+	// uintptr by the syscall ABI; narrowing it back to int32 restores the value
+	// the library actually returned, including negative failure codes.
 	if code := int32(r); code != 0 || token == nil {
 		detail := strings.Join(drainAttestationLog(), "; ")
 		if detail == "" {
@@ -231,7 +245,7 @@ func attestKeyGuard(endpoint, clientID string, key bindingKey) (string, error) {
 		return "", fmt.Errorf("managedidentity: KeyGuard attestation failed with native code %d (%v): %s", code, callErr, detail)
 	}
 	jwt := windows.BytePtrToString(token)
-	_, _, _ = syscall.SyscallN(lib.freeAttestationToken.Addr(), uintptr(unsafe.Pointer(token)))
+	_, _, _ = syscall.SyscallN(lib.freeAttestationToken, uintptr(unsafe.Pointer(token)))
 	if jwt == "" {
 		return "", fmt.Errorf("managedidentity: KeyGuard attestation produced an empty token: %s",
 			strings.Join(drainAttestationLog(), "; "))

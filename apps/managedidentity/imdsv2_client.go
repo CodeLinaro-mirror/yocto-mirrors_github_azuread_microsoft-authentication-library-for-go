@@ -6,6 +6,7 @@ package managedidentity
 import (
 	"context"
 	"crypto"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/oauth/ops"
@@ -189,19 +191,56 @@ func (v imdsV2) issueCredential(ctx context.Context, correlationID, csr, attesta
 
 // bindingCertificate is the certificate IMDS issued together with the key that
 // proves possession of it and the endpoint that will accept it.
+//
+// The key handle behind TLS.PrivateKey can outlive the cache entry: a caller
+// that received this certificate from an earlier acquisition may still be using
+// it when a later acquisition evicts or replaces the entry. Releasing the handle
+// is therefore reference counted rather than tied to eviction, so evicting can
+// never break a certificate a caller is still holding.
 type bindingCertificate struct {
 	TLS      tls.Certificate
 	Leaf     *x509.Certificate
 	ClientID string
 	TenantID string
 	Endpoint string
+
+	mu     sync.Mutex
+	refs   int
+	closed bool
 	// close releases the operating system handle behind the private key.
 	close func() error
 }
 
-// Close releases the binding key.
+// retain records an additional holder of the binding key. Every retain must be
+// paired with a Close.
+func (b *bindingCertificate) retain() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refs++
+}
+
+// Close drops one reference to the binding key and releases the underlying
+// handle once the last holder is gone.
 func (b *bindingCertificate) Close() error {
-	if b == nil || b.close == nil {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+	if b.refs > 0 {
+		b.refs--
+	}
+	if b.refs > 0 {
+		return nil
+	}
+	b.closed = true
+	if b.close == nil {
 		return nil
 	}
 	return b.close()
@@ -234,7 +273,10 @@ func newBindingCertificate(der []byte, leaf *x509.Certificate, key bindingKey, i
 		ClientID: issued.ClientID,
 		TenantID: issued.TenantID,
 		Endpoint: issued.MtlsAuthenticationEndpoint,
-		close:    key.Close,
+		// The caller of this function owns the first reference; the cache takes
+		// it over when the certificate is stored.
+		refs:  1,
+		close: key.Close,
 	}
 }
 
@@ -279,10 +321,43 @@ func (b *bindingCertificate) tokenEndpoint() (string, error) {
 	return fmt.Sprintf("https://%s/%s%s", u.Host, strings.Trim(b.TenantID, "/"), imdsV2OAuthPath), nil
 }
 
-// mtlsHTTPClient returns a client that presents the binding certificate. A new
-// client is built per binding certificate so that replacing the certificate
+// mtlsClientCache holds one client per binding certificate. A client is reused
+// across acquisitions so connections are actually pooled, which is what the rest
+// of MSAL does (see ops.SetMtlsClientFactory, which caches per thumbprint).
+// Building one per acquisition instead would strand an idle TLS connection for
+// the transport's idle timeout on every token request.
+var mtlsClientCache = struct {
+	mu      sync.Mutex
+	clients map[string]*http.Client
+}{clients: map[string]*http.Client{}}
+
+// mtlsHTTPClient returns a client that presents the binding certificate. The
+// client is keyed by the certificate itself so that replacing the certificate
 // cannot reuse a pooled connection authenticated with the previous one.
 func mtlsHTTPClient(cert tls.Certificate) *http.Client {
+	if len(cert.Certificate) == 0 {
+		return newMtlsHTTPClient(cert)
+	}
+	sum := sha256.Sum256(cert.Certificate[0])
+	key := string(sum[:])
+
+	mtlsClientCache.mu.Lock()
+	defer mtlsClientCache.mu.Unlock()
+	if client, ok := mtlsClientCache.clients[key]; ok {
+		return client
+	}
+	// A different certificate is now in use, so nothing pooled under the old one
+	// can be reused. Release those connections rather than leaving them idle.
+	for old, client := range mtlsClientCache.clients {
+		client.CloseIdleConnections()
+		delete(mtlsClientCache.clients, old)
+	}
+	client := newMtlsHTTPClient(cert)
+	mtlsClientCache.clients[key] = client
+	return client
+}
+
+func newMtlsHTTPClient(cert tls.Certificate) *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{

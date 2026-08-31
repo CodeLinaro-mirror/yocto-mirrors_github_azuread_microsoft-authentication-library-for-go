@@ -226,6 +226,11 @@ func useToken(cfg config, result confidential.AuthResult) error {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
+			// #nosec G402 -- MaxVersion is pinned to TLS 1.2 deliberately. Go
+			// implements renegotiation only for TLS 1.2 and does not implement
+			// the TLS 1.3 equivalent, post-handshake authentication, so pinning
+			// here is what lets Key Vault ask for the client certificate after
+			// reading the request. See the comment above.
 			TLSClientConfig: &tls.Config{
 				GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 					return result.BindingCertificate, nil

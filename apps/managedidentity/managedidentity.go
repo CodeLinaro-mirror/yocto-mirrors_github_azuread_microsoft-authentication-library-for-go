@@ -220,8 +220,10 @@ func WithClaims(claims string) AcquireTokenOption {
 //
 // Attestation needs AttestationClientLib.dll, a native Windows component that is
 // distributed separately and is not part of this module. Deploy it alongside the
-// host executable, or anywhere else on the loader search path. It is published in
-// the Microsoft.Azure.Security.KeyGuardAttestation package, under
+// host executable or install it into System32; those are the only two locations
+// searched, so a DLL dropped into the working directory or elsewhere on the
+// default loader search path is not picked up. It is published in the
+// Microsoft.Azure.Security.KeyGuardAttestation package, under
 // runtimes/win-x64/native.
 //
 // Without this option no attestation is attempted and the credential request goes
@@ -229,6 +231,10 @@ func WithClaims(claims string) AcquireTokenOption {
 // Microsoft.Identity.Client.KeyAttestation package is not referenced. With it, a
 // failure to attest is an error rather than a downgrade: a caller that asked for
 // attestation is never silently given a credential that lacks it.
+//
+// Attestation is only meaningful for the IMDSv2 mTLS flow, so this option
+// requires [WithMtlsProofOfPossession]; pairing it with a plain bearer-token
+// request returns [ErrAttestationRequiresMtls] rather than quietly ignoring it.
 func WithAttestationSupport() AcquireTokenOption {
 	return func(o *AcquireTokenOptions) {
 		o.attestation = true
@@ -379,8 +385,20 @@ func (c Client) AcquireToken(ctx context.Context, resource string, options ...Ac
 	var cachedBinding *bindingCertificate
 	if o.mtlsPoP {
 		if binding, ok := certCache.get(cacheKey(c.miType, o.attestation)); ok {
-			cachedBinding = binding
-			c.authParams.AuthnScheme = authority.NewMtlsPoPAuthenticationScheme(binding.Leaf)
+			// Serving a bound token straight from the cache skips leg 1, so the
+			// validation a normal acquisition performs has to happen here too.
+			// A certificate whose key was lost to a container reset still
+			// parses and still has the same thumbprint, so without this the
+			// caller would get a cached token plus a certificate it can no
+			// longer prove possession of.
+			if needsRefresh(binding) || isOrphaned(binding, c.bindingKeyProvider()) {
+				_ = binding.Close()
+				readCache = false
+			} else {
+				cachedBinding = binding
+				defer func() { _ = binding.Close() }()
+				c.authParams.AuthnScheme = authority.NewMtlsPoPAuthenticationScheme(binding.Leaf)
+			}
 		} else {
 			readCache = false
 		}
