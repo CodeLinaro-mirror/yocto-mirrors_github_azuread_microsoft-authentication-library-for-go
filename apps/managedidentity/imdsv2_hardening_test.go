@@ -598,6 +598,10 @@ func TestIMDSv2BindingCertificateSurvivesCallerValueCopy(t *testing.T) {
 }
 
 func TestIMDSv2AlternatingCertificatesKeepTheirClients(t *testing.T) {
+	// The cache is process-wide and bounded, so a test that inherits entries
+	// from another test can see its own two clients evicted for reasons that
+	// have nothing to do with what it is asserting.
+	withCleanCaches(t)
 	first := selfSignedTLSCertificate(t)
 	second := selfSignedTLSCertificate(t)
 
@@ -618,6 +622,7 @@ func TestIMDSv2AlternatingCertificatesKeepTheirClients(t *testing.T) {
 }
 
 func TestIMDSv2MtlsClientCacheIsBounded(t *testing.T) {
+	withCleanCaches(t)
 	for i := 0; i < mtlsClientCacheLimit*3; i++ {
 		mtlsHTTPClient(selfSignedTLSCertificate(t))
 	}

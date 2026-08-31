@@ -396,11 +396,13 @@ func withCleanCaches(t *testing.T) {
 	t.Helper()
 	certCache.clear()
 	clearAttestationCache()
+	clearMtlsClientCache()
 	cacheManager = storage.New(nil)
 	platformSupportsMtlsPoP = func() bool { return true }
 	t.Cleanup(func() {
 		certCache.clear()
 		clearAttestationCache()
+		clearMtlsClientCache()
 		cacheManager = storage.New(nil)
 		platformSupportsMtlsPoP = func() bool { return runtime.GOOS == "windows" }
 	})

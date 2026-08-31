@@ -366,6 +366,20 @@ func mtlsHTTPClient(cert tls.Certificate) *http.Client {
 	return client
 }
 
+// clearMtlsClientCache drops every cached client, closing idle connections so
+// the transports do not outlive whatever they were talking to. Tests use it to
+// isolate themselves from each other: the cache is process-wide and retains up
+// to mtlsClientCacheLimit entries, so without this a client built against one
+// test's server survives into the next.
+func clearMtlsClientCache() {
+	mtlsClientCache.mu.Lock()
+	defer mtlsClientCache.mu.Unlock()
+	for key, client := range mtlsClientCache.clients {
+		client.CloseIdleConnections()
+		delete(mtlsClientCache.clients, key)
+	}
+}
+
 func newMtlsHTTPClient(cert tls.Certificate) *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
