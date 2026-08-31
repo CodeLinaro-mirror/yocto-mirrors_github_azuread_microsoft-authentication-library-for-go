@@ -120,6 +120,14 @@ type keyProvider interface {
 // IMDSv2 must be bound to a VBS-isolated key. A software key would still
 // produce a syntactically valid proof-of-possession token while offering none
 // of its guarantees, so anything weaker is refused.
+//
+// This mirrors the check in ImdsV2ManagedIdentitySource.AcquireMtlsBindingAsync,
+// which runs for both v2 flows (_isMtlsPopRequested || _preferMsiV2) and throws
+// credential_guard_not_available when keyInfo.Type is not KeyGuard. .NET reaches
+// that check holding a hardware or in-memory key, because its Windows provider
+// falls back; msal-go asks CNG only for an isolated key, so on the same host it
+// fails earlier, in createPersistedKey, with the same error. Both routes are
+// pinned by TestKeyGuardRefusalMatchesDotNet.
 func requireKeyGuard(key bindingKey) error {
 	if key.Type == keyTypeKeyGuard {
 		return nil

@@ -36,6 +36,12 @@ const (
 	// [ErrCredentialGuardNotAvailable]. The tier is still reported faithfully,
 	// because it describes the host and is what MSAL .NET reports for the same
 	// machine.
+	//
+	// MSAL .NET refuses this tier too. Its Windows key provider falls back to a
+	// hardware or in-memory key when KeyGuard is unavailable, but
+	// ImdsV2ManagedIdentitySource.AcquireMtlsBindingAsync then rejects any key
+	// that is not KeyGuard, raising credential_guard_not_available. The extra
+	// tiers change the diagnostics, not the outcome.
 	MtlsBindingStrengthSoftware MtlsBindingStrength = 1
 
 	// 2 is reserved for a future tier, for example TPM-backed keys. MSAL .NET
