@@ -182,6 +182,8 @@ stages:
               version: $(goVersion)
           - task: PowerShell@2
             displayName: "Fetch the KeyGuard attestation library"
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
             inputs:
               targetType: "inline"
               script: |
@@ -199,11 +201,7 @@ stages:
                 New-Item -ItemType Directory -Force -Path $dir | Out-Null
                 $nupkg = "$dir\$pkg.$ver.nupkg"
                 $url = "https://pkgs.dev.azure.com/IdentityDivision/_packaging/IDDP_PublicPackages/nuget/v3/flat2/$pkg/$ver/$pkg.$ver.nupkg"
-                # No Authorization header: IDDP_PublicPackages serves this feed
-                # anonymously over HTTPS, and the package and version above are
-                # pinned. Sending a credential the feed does not ask for would
-                # only risk turning a working anonymous read into a 401.
-                Invoke-WebRequest -Uri $url -OutFile $nupkg
+                Invoke-WebRequest -Headers @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" } -Uri $url -OutFile $nupkg
                 Write-Host "downloaded $((Get-Item $nupkg).Length) bytes"
                 # A .nupkg is a zip, but Expand-Archive rejects the extension, so
                 # unpack it through the API that goes by content instead of name.
