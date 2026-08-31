@@ -144,6 +144,9 @@ type imdsFake struct {
 	attestationEndpoint string
 	// metadataBody, when set, replaces the leg 1 response body verbatim.
 	metadataBody string
+	// omitIssueFields names fields to drop from the leg 2 response, so a test
+	// can prove an incomplete issuance is rejected.
+	omitIssueFields []string
 }
 
 func newIMDSFake(t *testing.T) *imdsFake {
@@ -409,13 +412,17 @@ func (f *imdsFake) handleIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
+	issued := map[string]string{
 		"client_id":                    f.clientID,
 		"tenant_id":                    f.tenantID,
 		"certificate":                  base64.StdEncoding.EncodeToString(certDER),
 		"identity_type":                "SAMI",
 		"mtls_authentication_endpoint": f.tokenServer.Listener.Addr().String(),
-	})
+	}
+	for _, field := range f.omitIssueFields {
+		delete(issued, field)
+	}
+	_ = json.NewEncoder(w).Encode(issued)
 }
 
 func (f *imdsFake) handleToken(w http.ResponseWriter, r *http.Request) {
@@ -1651,7 +1658,7 @@ func TestIMDSRedirectGuardLeavesACallersPolicyAlone(t *testing.T) {
 type notAnHTTPClient struct{}
 
 func (notAnHTTPClient) Do(*http.Request) (*http.Response, error) { return nil, nil }
-func (notAnHTTPClient) CloseIdleConnections()                     {}
+func (notAnHTTPClient) CloseIdleConnections()                    {}
 
 // signerFor lets the CSR tests reuse a software key through the same interface
 // the flow uses.

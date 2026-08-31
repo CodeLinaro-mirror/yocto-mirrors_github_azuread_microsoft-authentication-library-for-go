@@ -40,8 +40,11 @@ type persistedCertificate struct {
 // MSAL .NET makes the same choice in IPersistentCertificateCache.
 type persistentCertCache interface {
 	// read returns the newest certificate stored for alias that still has at
-	// least bindingCertRefreshWindow of life left and whose private key is
-	// still present. Certificates found to be orphaned are removed.
+	// least bindingCertRefreshWindow of life left and that names the container
+	// the binding key lives in. Naming the container is all a store can check
+	// cheaply; whether the key is still there, and so whether the entry is
+	// orphaned, is settled by bindingCertCache.restore, which opens the key and
+	// calls deleteAll when it has gone.
 	read(alias string) (*persistedCertificate, bool)
 	// write stores cert for alias and prunes expired entries.
 	write(alias string, cert *bindingCertificate)

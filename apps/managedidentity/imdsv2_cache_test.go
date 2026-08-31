@@ -86,6 +86,59 @@ func TestBindingCertificateMintedOncePerIdentity(t *testing.T) {
 	}
 }
 
+// The same single-flight property, asserted against the mint gate itself.
+//
+// TestBindingCertificateMintedOncePerIdentity above cannot prove the gate
+// works: it goes through AcquireToken, and miTokenGate already serializes every
+// managed identity acquisition process-wide, so the first caller populates the
+// cache and the rest hit it no matter what the gate does. Neutering enter/leave
+// entirely leaves that test green. This one calls getBindingCertificate
+// directly, so the gate is the only thing standing between concurrent callers
+// and one IMDS credential request each.
+func TestMintGateCollapsesConcurrentIssuance(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	provider := newFakeKeyProvider()
+	v := imdsV2{
+		httpClient:   fake.metadataServer.Client(),
+		keyProvider:  provider,
+		miType:       SystemAssigned(),
+		baseEndpoint: fake.metadataServer.URL,
+		retryEnabled: true,
+	}
+
+	const callers = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, err := v.getBindingCertificate(context.Background(), false)
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("getBindingCertificate: %v", err)
+		}
+	}
+
+	// Leg 1 runs per caller by design: it is what detects an identity change
+	// underneath a cached certificate. Only issuance is gated.
+	if issued := fake.countOf("issue"); issued != 1 {
+		t.Fatalf("issued %d certificates, want 1: the mint gate should collapse concurrent issuance", issued)
+	}
+	if provider.creates != 1 {
+		t.Fatalf("created %d keys, want 1", provider.creates)
+	}
+}
+
 // A caller queued behind another's mint has to stay cancellable: minting makes
 // two network calls, and a request whose deadline passes while it waits must
 // give up rather than block for the full duration.

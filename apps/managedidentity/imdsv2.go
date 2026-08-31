@@ -317,8 +317,14 @@ func newEntraTokenError(statusCode int, body []byte) error {
 // or a handshake failure when the server rejects the client certificate before
 // any HTTP response exists to carry an error code. Both are fixed by minting a
 // new certificate, and neither is fixed by retrying with the same one.
-// bindingKeySignFailureMarker appears in every error the binding key's signer
-// returns.
+// bindingKeySignFailureMarker appears on every failure that means the key
+// itself can no longer sign: a closed key, or either NCryptSignHash call. The
+// signer's three argument checks - a nil SignerOpts, a digest whose length
+// disagrees with the hash, and a hash CNG has no name for - deliberately omit
+// it, because they report a caller mistake that a new certificate would not
+// fix. crypto/tls cannot produce any of them: it always supplies opts, sizes
+// the digest from the hash it passes, and negotiates only SHA-256, SHA-384 or
+// SHA-512 for RSA, every one of which algorithmIdentifier accepts.
 //
 // A certificate is worth nothing once the private key behind it can no longer
 // sign, and that happens for reasons the server never sees: the isolated

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"io"
 	"math/big"
+	"net/http"
 	"runtime"
 	"strings"
 	"sync"
@@ -692,4 +693,125 @@ func selfSignedTLSCertificate(t *testing.T) tls.Certificate {
 	}
 	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 	return cert
+}
+
+// A metadata document with no attestationEndpoint is refused even when this
+// acquisition is not going to attest.
+//
+// MSAL .NET rejects the document outright in CsrMetadata.ValidateCsrMetadata
+// rather than only on the attesting path, so a host that omits the field is
+// misconfigured for every caller and both libraries refuse it at the same
+// point. TestIMDSv2RejectsHostileAttestationEndpoint covers the attesting side,
+// but it cannot pin this: it asks for attestation, and attestationURL rejects an
+// empty endpoint with a message carrying the same "no attestationEndpoint" text,
+// so deleting the check in csrMetadata.validate leaves that test green. This one
+// never asks for attestation, so only validate can produce the error.
+func TestIMDSv2RejectsMetadataWithoutAttestationEndpointWhenNotAttesting(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.metadataBody = `{"cuId":{"vmId":"vm-1"},"clientId":"` + fake.clientID +
+		`","tenantId":"` + fake.tenantID + `"}`
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	_, err := client.AcquireToken(context.Background(), "https://vault.azure.net",
+		WithMtlsProofOfPossession())
+	if err == nil {
+		t.Fatal("expected metadata without an attestationEndpoint to be rejected")
+	}
+	if !strings.Contains(err.Error(), "attestationEndpoint") {
+		t.Errorf("error = %v, want it to name attestationEndpoint", err)
+	}
+	// The document is refused on leg 1, so no credential is ever requested.
+	if got := fake.countCalls("issue"); got != 0 {
+		t.Errorf("issue requests = %d, want 0", got)
+	}
+}
+
+// Every field certificateRequestResponse.validate requires is refused when IMDS
+// leaves it out. identity_type is the field that makes this worth pinning:
+// nothing downstream reads it, so validate is the only thing standing between a
+// truncated issuance response and a certificate the caller believes is complete.
+func TestIMDSv2RejectsIncompleteCredentialResponse(t *testing.T) {
+	for _, field := range []string{
+		"client_id",
+		"tenant_id",
+		"certificate",
+		"identity_type",
+		"mtls_authentication_endpoint",
+	} {
+		t.Run(field, func(t *testing.T) {
+			withCleanCaches(t)
+			fake := newIMDSFake(t)
+			fake.omitIssueFields = []string{field}
+			client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+			ar, err := client.AcquireToken(context.Background(), "https://vault.azure.net",
+				WithMtlsProofOfPossession())
+			if err == nil {
+				t.Fatalf("expected a response missing %s to be rejected, got token %q", field, ar.AccessToken)
+			}
+			if !strings.Contains(err.Error(), field) {
+				t.Errorf("error = %v, want it to name the missing field %s", err, field)
+			}
+			// A rejected issuance must not reach the token endpoint.
+			if got := fake.countCalls("token"); got != 0 {
+				t.Errorf("token requests = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// A 404 from the credential endpoint is a plain failure, not the signal that
+// this host only speaks IMDSv1.
+//
+// Only leg 1 carries that meaning: reaching leg 2 at all proves the host served
+// the v2 metadata document, so a 404 here is the endpoint misbehaving. Mapping
+// it to ErrMtlsPoPNotSupportedInIMDSv1 would tell a credential chain to give up
+// on managed identity for a host that plainly supports it.
+func TestIMDSv2CredentialLegNotFoundIsNotAV1Signal(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.issueStatus = http.StatusNotFound
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	_, err := client.AcquireToken(context.Background(), "https://vault.azure.net",
+		WithMtlsProofOfPossession())
+	if err == nil {
+		t.Fatal("expected a 404 from the credential endpoint to fail the acquisition")
+	}
+	if errors.Is(err, ErrMtlsPoPNotSupportedInIMDSv1) {
+		t.Errorf("error = %v, want a generic failure rather than the IMDSv1 signal", err)
+	}
+}
+
+// A metadata document larger than the read limit is refused rather than buffered.
+//
+// The IMDS legs are unauthenticated plain HTTP, so anything answering on the
+// link-local address can reply with as much data as it likes. readIMDSResponse
+// caps the body at 1 MiB; without the cap a hostile responder could make the
+// process allocate without bound.
+//
+// The body is a fully valid metadata document with a large ignored field in
+// front of the real ones. That shape is what makes the test sensitive: the cap
+// truncates it mid-padding into unparseable JSON, while a build without the cap
+// would read the whole thing, find every required field, and mint a token. A
+// body of padding alone would be rejected either way, for missing fields, and
+// would prove nothing.
+func TestIMDSv2RejectsAnOversizedMetadataBody(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.metadataBody = `{"padding":"` + strings.Repeat("a", 2<<20) + `","cuId":{"vmId":"vm-1"},"clientId":"` +
+		fake.clientID + `","tenantId":"` + fake.tenantID + `","attestationEndpoint":"` +
+		fake.attestationEndpoint + `"}`
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	ar, err := client.AcquireToken(context.Background(), "https://vault.azure.net",
+		WithMtlsProofOfPossession())
+	if err == nil {
+		t.Fatalf("expected an oversized metadata body to be rejected, got token %q", ar.AccessToken)
+	}
+	// The body never parses, so no credential is requested.
+	if got := fake.countCalls("issue"); got != 0 {
+		t.Errorf("issue requests = %d, want 0", got)
+	}
 }

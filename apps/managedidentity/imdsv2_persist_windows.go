@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"math"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -180,6 +181,11 @@ func usesBindingKeyContainer(ctx *windows.CertContext) bool {
 	if info.keySpec != certNCryptKeySpec {
 		return false
 	}
+	// containerName and provName point at wide strings crypt32 appended inside
+	// buf, so buf has to outlive the reads. The loaded pointers do keep the
+	// backing array alive on their own, but buf is what the reader can see, and
+	// keyCanSign and Sign hold their CNG structures the same way.
+	defer runtime.KeepAlive(buf)
 	return utf16PtrToString(info.containerName) == bindingKeyName &&
 		utf16PtrToString(info.provName) == msKeyStorageProvider
 }

@@ -232,9 +232,10 @@ func WithClaims(claims string) AcquireTokenOption {
 //
 // Attestation needs AttestationClientLib.dll, a native Windows component that is
 // distributed separately and is not part of this module. Deploy it alongside the
-// host executable or install it into System32; those are the only two locations
-// searched, so a DLL dropped into the working directory or elsewhere on the
-// default loader search path is not picked up. It is published in the
+// host executable or install it into System32. The load is restricted to the
+// application directory, System32 and any directory the process itself added
+// with AddDllDirectory, so a DLL dropped into the working directory or found on
+// %PATH% is not picked up. It is published in the
 // Microsoft.Azure.Security.KeyGuardAttestation package, under
 // runtimes/win-x64/native.
 //
