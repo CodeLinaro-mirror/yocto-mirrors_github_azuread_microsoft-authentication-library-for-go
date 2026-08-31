@@ -19,12 +19,12 @@ import (
 func recordRetryWaits(t *testing.T) *[]time.Duration {
 	t.Helper()
 	waits := []time.Duration{}
-	real := imdsRetryWait
-	imdsRetryWait = func(ctx context.Context, d time.Duration) error {
+	real := retryWait
+	retryWait = func(ctx context.Context, d time.Duration) error {
 		waits = append(waits, d)
 		return ctx.Err()
 	}
-	t.Cleanup(func() { imdsRetryWait = real })
+	t.Cleanup(func() { retryWait = real })
 	return &waits
 }
 
@@ -344,5 +344,152 @@ func TestSendIMDSRequestDoesNotRetryACanceledContext(t *testing.T) {
 	}
 	if fake.calls > 1 {
 		t.Errorf("calls = %d, want a canceled context not to be retried", fake.calls)
+	}
+}
+
+// --- Entra token endpoint (STS) ---
+
+// The token endpoint is a remote service, so only a server error is worth
+// repeating; a 404 or 410 there is an answer about the request itself.
+func TestSTSRetriableStatusOnlyCoversServerErrors(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		want   bool
+	}{
+		{http.StatusInternalServerError, true},
+		{http.StatusBadGateway, true},
+		{http.StatusServiceUnavailable, true},
+		{599, true},
+		{http.StatusOK, false},
+		{http.StatusBadRequest, false},
+		{http.StatusUnauthorized, false},
+		{http.StatusNotFound, false},
+		{http.StatusRequestTimeout, false},
+		{http.StatusGone, false},
+		{http.StatusTooManyRequests, false},
+	} {
+		resp := &http.Response{StatusCode: test.status, Header: http.Header{}}
+		if got := stsRetriableStatus(resp); got != test.want {
+			t.Errorf("stsRetriableStatus(%d) = %v, want %v", test.status, got, test.want)
+		}
+	}
+}
+
+// Retry-After means the service has said how long to wait, so the request is
+// not repeated sooner. A value that parses as neither a delay nor a date
+// carries no instruction and is ignored.
+func TestSTSRetriableStatusHonorsRetryAfter(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		retryAfter string
+		want       bool
+	}{
+		{"absent", "", true},
+		{"delay in seconds", "30", false},
+		{"zero seconds", "0", false},
+		{"http date", "Wed, 21 Oct 2099 07:28:00 GMT", false},
+		{"unparseable", "soon", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{}}
+			if test.retryAfter != "" {
+				resp.Header.Set("Retry-After", test.retryAfter)
+			}
+			if got := stsRetriableStatus(resp); got != test.want {
+				t.Errorf("stsRetriableStatus with Retry-After %q = %v, want %v", test.retryAfter, got, test.want)
+			}
+		})
+	}
+}
+
+func TestSendSTSRequestRetriesOnceOnAServerError(t *testing.T) {
+	waits := recordRetryWaits(t)
+	fake := &retryFake{statuses: []int{http.StatusServiceUnavailable}}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, strings.NewReader("grant_type=client_credentials"))
+	resp, err := sendSTSRequest(context.Background(), srv.Client(), req, true)
+	if err != nil {
+		t.Fatalf("sendSTSRequest: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want the retry to succeed", resp.StatusCode)
+	}
+	if fake.calls != 2 {
+		t.Errorf("calls = %d, want 1 attempt plus 1 retry", fake.calls)
+	}
+	if len(*waits) != 1 || (*waits)[0] != time.Second {
+		t.Errorf("waits = %v, want a single one second pause", *waits)
+	}
+	for i, got := range fake.bodies {
+		if got != "grant_type=client_credentials" {
+			t.Errorf("attempt %d sent body %q, want the form replayed", i, got)
+		}
+	}
+}
+
+// The budget is one retry, not the three the IMDS legs get: a token endpoint
+// that is still failing on the second attempt is not going to clear in seconds.
+func TestSendSTSRequestStopsAfterOneRetry(t *testing.T) {
+	waits := recordRetryWaits(t)
+	fake := &retryFake{statuses: []int{500, 500, 500, 500}}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, strings.NewReader("x=1"))
+	resp, err := sendSTSRequest(context.Background(), srv.Client(), req, true)
+	if err != nil {
+		t.Fatalf("sendSTSRequest: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if fake.calls != 2 {
+		t.Errorf("calls = %d, want 1 attempt plus 1 retry", fake.calls)
+	}
+	if len(*waits) != 1 {
+		t.Errorf("waits = %v, want a single pause", *waits)
+	}
+}
+
+func TestSendSTSRequestDoesNotRetryWhenToldToBackOff(t *testing.T) {
+	recordRetryWaits(t)
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, strings.NewReader("x=1"))
+	resp, err := sendSTSRequest(context.Background(), srv.Client(), req, true)
+	if err != nil {
+		t.Fatalf("sendSTSRequest: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if calls != 1 {
+		t.Errorf("calls = %d, want the Retry-After to be respected rather than retried", calls)
+	}
+}
+
+func TestSendSTSRequestHonorsADisabledRetryPolicy(t *testing.T) {
+	recordRetryWaits(t)
+	fake := &retryFake{statuses: []int{500, 500}}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, strings.NewReader("x=1"))
+	resp, err := sendSTSRequest(context.Background(), srv.Client(), req, false)
+	if err != nil {
+		t.Fatalf("sendSTSRequest: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if fake.calls != 1 {
+		t.Errorf("calls = %d, want exactly one request", fake.calls)
 	}
 }

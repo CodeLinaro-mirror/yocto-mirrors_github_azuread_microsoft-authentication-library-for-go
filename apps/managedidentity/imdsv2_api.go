@@ -129,7 +129,7 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 	// variable rather than capturing the first value.
 	defer func() { _ = binding.Close() }()
 
-	tr, err := requestEntraToken(ctx, c.mtlsClient(binding.TLS), binding, resource, o.mtlsPoP)
+	tr, err := requestEntraToken(ctx, c.mtlsClient(binding.TLS), binding, resource, o.mtlsPoP, c.retryPolicyEnabled)
 	if err != nil {
 		if !shouldRemintCertificate(err) {
 			return AuthResult{}, err
@@ -141,7 +141,7 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 		}
 		_ = binding.Close()
 		binding = reminted
-		tr, err = requestEntraToken(ctx, c.mtlsClient(binding.TLS), binding, resource, o.mtlsPoP)
+		tr, err = requestEntraToken(ctx, c.mtlsClient(binding.TLS), binding, resource, o.mtlsPoP, c.retryPolicyEnabled)
 		if err != nil {
 			return AuthResult{}, err
 		}

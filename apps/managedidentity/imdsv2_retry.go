@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/oauth/ops"
@@ -51,14 +53,14 @@ func imdsRetriableStatus(status int) bool {
 	return status >= 500 && status <= 599
 }
 
-// imdsRetriableError reports whether a transport-level failure should be
+// retriableTransportError reports whether a transport-level failure should be
 // retried. MSAL .NET retries exactly one exception here, TaskCanceledException,
 // which is what its HTTP client raises on a timeout; the Go equivalent is a
 // timeout from the client or from a per-request deadline.
 //
 // A context that the caller canceled is never retried: the caller has already
 // given up, so another attempt would only delay the error it is waiting for.
-func imdsRetriableError(ctx context.Context, err error) bool {
+func retriableTransportError(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return false
 	}
@@ -84,9 +86,9 @@ func imdsRetryDelay(retry int) time.Duration {
 	return delay
 }
 
-// imdsRetryWait sleeps for d unless ctx ends first. It is a variable so tests
+// retryWait sleeps for d unless ctx ends first. It is a variable so tests
 // can observe the schedule without waiting out a real backoff.
-var imdsRetryWait = func(ctx context.Context, d time.Duration) error {
+var retryWait = func(ctx context.Context, d time.Duration) error {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
@@ -131,7 +133,7 @@ func sendIMDSRequest(ctx context.Context, client ops.HTTPClient, req *http.Reque
 		retriable := false
 		switch {
 		case err != nil:
-			retriable = imdsRetriableError(ctx, err)
+			retriable = retriableTransportError(ctx, err)
 			if maxRetries < 0 {
 				maxRetries = imdsExponentialRetries
 			}
@@ -159,12 +161,95 @@ func sendIMDSRequest(ctx context.Context, client ops.HTTPClient, req *http.Reque
 		// instead of opening a new one.
 		drainResponse(resp)
 
-		if waitErr := imdsRetryWait(ctx, delay); waitErr != nil {
+		if waitErr := retryWait(ctx, delay); waitErr != nil {
 			return nil, waitErr
 		}
 	}
 }
 
+// The Entra token endpoint is retried on different terms from IMDS. It is a
+// remote service rather than a local agent, so a 404 or a 410 is an answer
+// about the request rather than a service that has not finished starting, and
+// only a server error is worth repeating. MSAL .NET uses HttpRetryConditions.Sts
+// and DefaultRetryPolicy for RequestType.STS here.
+const (
+	// stsRetries is the number of retries after the first attempt.
+	stsRetries      = 1
+	stsRetryBackoff = 1 * time.Second
+)
+
+// stsRetriableStatus reports whether an Entra token response should be retried.
+//
+// A response carrying Retry-After is never retried: the service has said how
+// long to wait, and repeating the request sooner ignores it. MSAL .NET declines
+// the retry in the same case rather than honouring the delay, so that a caller
+// is not silently held for whatever period the service asked for.
+func stsRetriableStatus(resp *http.Response) bool {
+	if hasRetryAfter(resp) {
+		return false
+	}
+	return resp.StatusCode >= 500 && resp.StatusCode <= 599
+}
+
+// hasRetryAfter reports whether the response carries a Retry-After the caller
+// could act on. A value that parses as neither a delay nor a date is treated as
+// absent, matching what .NET's typed header does with an unusable value.
+func hasRetryAfter(resp *http.Response) bool {
+	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if v == "" {
+		return false
+	}
+	if _, err := strconv.Atoi(v); err == nil {
+		return true
+	}
+	_, err := http.ParseTime(v)
+	return err == nil
+}
+
+// sendSTSRequest sends the mutual-TLS token request and retries it once if
+// Entra answers with a server error.
+//
+// This is separate from the certificate re-mint in acquireTokenForIMDSv2, which
+// reacts to a rejected certificate rather than to a failing service; the two do
+// not overlap, because a server error is not a reason to mint a new
+// certificate.
+func sendSTSRequest(ctx context.Context, client *http.Client, req *http.Request, retryEnabled bool) (*http.Response, error) {
+	if !retryEnabled {
+		return client.Do(req)
+	}
+
+	var resp *http.Response
+	var err error
+	for retry := 0; ; retry++ {
+		attempt := req
+		if retry > 0 {
+			attempt, err = rewindRequest(req)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		resp, err = client.Do(attempt)
+
+		retriable := false
+		if err != nil {
+			retriable = retriableTransportError(ctx, err)
+		} else {
+			retriable = stsRetriableStatus(resp)
+		}
+
+		if !retriable || retry >= stsRetries {
+			return resp, err
+		}
+
+		drainResponse(resp)
+		if waitErr := retryWait(ctx, stsRetryBackoff); waitErr != nil {
+			return nil, waitErr
+		}
+	}
+}
+
+// rewindRequest clones req with a fresh body so it can be sent again.
 // rewindRequest clones req with a fresh body so it can be sent again.
 //
 // The clone shares req's body reader, which the previous attempt has already

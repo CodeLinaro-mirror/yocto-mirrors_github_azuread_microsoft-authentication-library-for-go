@@ -414,15 +414,15 @@ func withCleanCaches(t *testing.T) {
 	// The retry schedule is real time. Tests that exercise a retriable status
 	// would otherwise wait out the backoff, so the wait is recorded rather than
 	// served. A test that cares about the schedule installs its own.
-	realWait := imdsRetryWait
-	imdsRetryWait = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+	realWait := retryWait
+	retryWait = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
 	t.Cleanup(func() {
 		certCache.clear()
 		clearAttestationCache()
 		clearMtlsClientCache()
 		cacheManager = storage.New(nil)
 		platformSupportsMtlsPoP = func() bool { return runtime.GOOS == "windows" }
-		imdsRetryWait = realWait
+		retryWait = realWait
 	})
 }
 
@@ -976,6 +976,27 @@ func TestIMDSv2RemintsCertificateOnInvalidClient(t *testing.T) {
 	// metadata, issue, token(fail), metadata, issue, token(ok)
 	if got := strings.Join(fake.calls, ","); got != "metadata,issue,token,metadata,issue,token" {
 		t.Fatalf("call sequence = %v, want a single re-mint and retry", fake.calls)
+	}
+}
+
+// A server error from the token endpoint is retried on the certificate already
+// in hand. It is distinct from the re-mint path, which reacts to a certificate
+// Entra has rejected: a 503 says nothing about the certificate, so minting a
+// new one would be wasted work against a service that is already struggling.
+func TestIMDSv2RetriesTheTokenLegOnAServerError(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	fake.tokenFailures = 1
+	fake.tokenFailureCode = http.StatusServiceUnavailable
+	fake.tokenFailureBody = `{"error":"temporarily_unavailable"}`
+
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession()); err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "metadata,issue,token,token" {
+		t.Errorf("calls = %q, want the token request retried without a new certificate", got)
 	}
 }
 

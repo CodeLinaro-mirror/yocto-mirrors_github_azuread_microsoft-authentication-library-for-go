@@ -404,7 +404,7 @@ func newMtlsHTTPClient(cert tls.Certificate) *http.Client {
 // connection authenticated by the binding certificate. When popRequested is
 // true the request asks for a certificate-bound token, otherwise it asks for an
 // ordinary bearer token that merely travelled over mTLS.
-func requestEntraToken(ctx context.Context, client *http.Client, binding *bindingCertificate, resource string, popRequested bool) (accesstokens.TokenResponse, error) {
+func requestEntraToken(ctx context.Context, client *http.Client, binding *bindingCertificate, resource string, popRequested, retryEnabled bool) (accesstokens.TokenResponse, error) {
 	target, err := binding.tokenEndpoint()
 	if err != nil {
 		return accesstokens.TokenResponse{}, err
@@ -424,7 +424,7 @@ func requestEntraToken(ctx context.Context, client *http.Client, binding *bindin
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := client.Do(req)
+	resp, err := sendSTSRequest(ctx, client, req, retryEnabled)
 	if err != nil {
 		return accesstokens.TokenResponse{}, fmt.Errorf("managedidentity: requesting a token over mTLS: %w", err)
 	}
