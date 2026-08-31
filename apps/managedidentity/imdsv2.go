@@ -123,6 +123,14 @@ func (m csrMetadata) attestationURL() (string, error) {
 		return "", fmt.Errorf("managedidentity: attestation was requested but IMDS returned no attestationEndpoint")
 	}
 	raw := strings.TrimSuffix(m.AttestationEndpoint, "/")
+	// A backslash is never part of a URL authority, and every parser that
+	// disagrees does so in the attacker's favour: C++ URL parsers fold it to a
+	// slash, so "https:/\/\attacker.example" names attacker.example to them
+	// while net/url reads no authority there at all. Rejecting it outright is
+	// the only reading both parsers can agree on.
+	if strings.Contains(raw, `\`) {
+		return "", fmt.Errorf("managedidentity: IMDS returned an attestation endpoint with a backslash in it %q", m.AttestationEndpoint)
+	}
 	if !strings.Contains(raw, "://") {
 		raw = "https://" + raw
 	}
@@ -135,6 +143,21 @@ func (m csrMetadata) attestationURL() (string, error) {
 	}
 	if u.Hostname() == "" {
 		return "", fmt.Errorf("managedidentity: IMDS returned an attestation endpoint with no host %q", m.AttestationEndpoint)
+	}
+	// A colon in the authority with nothing usable after it means it never
+	// parsed as an authority. "https:/nonsense" reaches here as a host of
+	// "https:" because the value carries no "://" and so had a second scheme
+	// prepended; returning it would hand a malformed origin to the native
+	// parser.
+	if u.Port() == "" && strings.Contains(u.Host, ":") {
+		return "", fmt.Errorf("managedidentity: IMDS returned an attestation endpoint with a malformed authority %q", m.AttestationEndpoint)
+	}
+	// Userinfo makes the authority read one way to a person and another to a
+	// resolver: "https://attestation.example@attacker.example" resolves to
+	// attacker.example while looking like the real endpoint in a log. No MAA
+	// endpoint has it, so its presence is only ever an attempt to disguise one.
+	if u.User != nil {
+		return "", fmt.Errorf("managedidentity: IMDS returned an attestation endpoint with userinfo in it %q", m.AttestationEndpoint)
 	}
 	return "https://" + u.Host, nil
 }
@@ -274,6 +297,23 @@ func newEntraTokenError(statusCode int, body []byte) error {
 // or a handshake failure when the server rejects the client certificate before
 // any HTTP response exists to carry an error code. Both are fixed by minting a
 // new certificate, and neither is fixed by retrying with the same one.
+// bindingKeySignFailureMarker appears in every error the binding key's signer
+// returns.
+//
+// A certificate is worth nothing once the private key behind it can no longer
+// sign, and that happens for reasons the server never sees: the isolated
+// container is reset, or a handle is closed while a cached TLS client still
+// holds it. The failure then surfaces inside the handshake as our own signing
+// error, so unless it is recognised the client keeps presenting the same dead
+// certificate for the life of the process.
+//
+// It has to be matched as text. crypto/tls reports the failure as
+// "tls: failed to sign handshake: " + err.Error(), a concatenation rather than a
+// wrapped error, so the chain - and any sentinel in it - is gone by the time the
+// caller sees the failure. This is the same fallback certificateAlertText relies
+// on for TLS alerts.
+const bindingKeySignFailureMarker = "managedidentity: the binding key cannot sign"
+
 func shouldRemintCertificate(err error) bool {
 	if err == nil {
 		return false
@@ -281,6 +321,9 @@ func shouldRemintCertificate(err error) bool {
 	var tokenErr *entraTokenError
 	if errors.As(err, &tokenErr) {
 		return tokenErr.Code == "invalid_client"
+	}
+	if strings.Contains(err.Error(), bindingKeySignFailureMarker) {
+		return true
 	}
 	// A failure to verify the server's own chain is deliberately not treated as
 	// re-mintable: our certificate is not the problem, and silently retrying

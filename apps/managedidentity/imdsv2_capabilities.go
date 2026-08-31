@@ -118,22 +118,28 @@ func (c Capabilities) IsMtlsPoPSupportedByHost() bool {
 //
 // Discovery probes the metadata service and provisions a binding key, neither
 // of which is cheap and neither of which changes while the process runs, so it
-// is done once. The mutex also makes it single-flight: concurrent callers at
-// startup wait for the first probe rather than each issuing their own, which is
-// what would otherwise happen in a service that resolves credentials on many
-// goroutines at once. MSAL .NET does the same with a static field and a
-// semaphore.
+// is done once. gate makes it single-flight: concurrent callers at startup wait
+// for the first probe rather than each issuing their own, which is what would
+// otherwise happen in a service that resolves credentials on many goroutines at
+// once. MSAL .NET does the same with a static field and a semaphore.
+//
+// gate is a channel rather than the mutex because discovery makes network calls
+// and a failing metadata service can hold a probe for a minute of retries.
+// Waiting behind the mutex would make every queued caller ignore its own
+// deadline; a channel lets one give up. mu therefore only ever covers the two
+// field accesses.
 //
 // expires separates the two kinds of negative answer. A definitive one - "this
 // host serves IMDSv1 only", "this platform has no key provider" - is a fact
 // about the host that cannot change while the process runs, so it is stored
 // with a zero expires and never revisited. A transient failure is not an answer
 // at all, so it is only reused until expires.
-var capabilitiesCache struct {
+var capabilitiesCache = struct {
 	mu      sync.Mutex
+	gate    chan struct{}
 	result  *Capabilities
 	expires time.Time
-}
+}{gate: make(chan struct{}, 1)}
 
 // capabilitiesRetryInterval is how long a transient discovery failure is reused
 // before the host is probed again.
@@ -169,14 +175,23 @@ func clearCapabilitiesCache() {
 // capabilitiesRetryInterval and then re-probed, so a host that was briefly
 // unreachable is not written off for the life of the process.
 func (c Client) Capabilities(ctx context.Context) (Capabilities, error) {
-	capabilitiesCache.mu.Lock()
-	defer capabilitiesCache.mu.Unlock()
-	if capabilitiesCache.result != nil &&
-		(capabilitiesCache.expires.IsZero() || now().Before(capabilitiesCache.expires)) {
-		return *capabilitiesCache.result, nil
+	if result, ok := cachedCapabilities(); ok {
+		return result, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return Capabilities{}, err
+	}
+	select {
+	case capabilitiesCache.gate <- struct{}{}:
+	case <-ctx.Done():
+		return Capabilities{}, ctx.Err()
+	}
+	defer func() { <-capabilitiesCache.gate }()
+
+	// Whoever held the gate may have answered the question while this caller
+	// was queued behind it.
+	if result, ok := cachedCapabilities(); ok {
+		return result, nil
 	}
 
 	result, definitive := c.discoverCapabilities(ctx)
@@ -186,13 +201,29 @@ func (c Client) Capabilities(ctx context.Context) (Capabilities, error) {
 		// cancelled call poison every later one.
 		return Capabilities{}, ctxErr
 	}
+	storeCapabilities(result, definitive)
+	return result, nil
+}
+
+func cachedCapabilities() (Capabilities, bool) {
+	capabilitiesCache.mu.Lock()
+	defer capabilitiesCache.mu.Unlock()
+	if capabilitiesCache.result != nil &&
+		(capabilitiesCache.expires.IsZero() || now().Before(capabilitiesCache.expires)) {
+		return *capabilitiesCache.result, true
+	}
+	return Capabilities{}, false
+}
+
+func storeCapabilities(result Capabilities, definitive bool) {
+	capabilitiesCache.mu.Lock()
+	defer capabilitiesCache.mu.Unlock()
 	capabilitiesCache.result = &result
 	if definitive {
 		capabilitiesCache.expires = time.Time{}
 	} else {
 		capabilitiesCache.expires = now().Add(capabilitiesRetryInterval)
 	}
-	return result, nil
 }
 
 // discoverCapabilities works out what this host supports. The second return
@@ -237,17 +268,56 @@ func (c Client) discoverCapabilities(ctx context.Context) (Capabilities, bool) {
 		// than an answer, and the retries above have already given it every
 		// chance to succeed, so it is reported but not treated as final.
 		definitive := errors.Is(err, ErrMtlsPoPNotSupportedInIMDSv1)
-		return Capabilities{
-			Source:                      DefaultToIMDS,
-			MaxSupportedBindingStrength: MtlsBindingStrengthNone,
-			ErrorReason:                 err.Error(),
-		}, definitive
+		if !definitive {
+			return Capabilities{
+				Source:                      DefaultToIMDS,
+				MaxSupportedBindingStrength: MtlsBindingStrengthNone,
+				ErrorReason:                 err.Error(),
+			}, false
+		}
+		return capabilitiesForIMDSv1(v, ctx, err), true
 	}
 
 	return Capabilities{
 		Source:                      DefaultToIMDS,
 		MaxSupportedBindingStrength: bindingStrengthFor(v.keyProvider),
 	}, true
+}
+
+// capabilitiesForIMDSv1 describes a host that has answered that it serves
+// IMDSv1 only.
+//
+// Such a host cannot run the v2 CSR flow, so this library will not mint a
+// binding certificate on it. The tier is still reported from the instance
+// compute document, because Capabilities describes the host rather than what
+// this library will do with it: a credential chain uses it to decide whether
+// managed identity is worth attempting at all, and MSAL .NET reports the same
+// tier for the same machine from the same document
+// (ManagedIdentityClient.DetermineImdsV1BindingStrengthAsync). Reporting None
+// where .NET reports Software would make the two libraries disagree about a
+// machine.
+//
+// Software is the ceiling here, deliberately. A security profile is a statement
+// about the platform, not a successful VBS attestation, so claiming the attested
+// KeyGuard tier from it would overclaim; .NET makes the same choice and says so.
+//
+// Any failure to read the document reports no binding, matching .NET's
+// treatment of a null response. The v2 failure is reported as the reason only
+// when the answer is that nothing can bind, because a host that did produce a
+// tier has been described successfully and has no error to report.
+func capabilitiesForIMDSv1(v imdsV2, ctx context.Context, v2Err error) Capabilities {
+	compute, err := v.getComputeMetadata(ctx, newCorrelationID())
+	if err == nil && compute.supportsMtlsPoP() {
+		return Capabilities{
+			Source:                      DefaultToIMDS,
+			MaxSupportedBindingStrength: MtlsBindingStrengthSoftware,
+		}
+	}
+	return Capabilities{
+		Source:                      DefaultToIMDS,
+		MaxSupportedBindingStrength: MtlsBindingStrengthNone,
+		ErrorReason:                 v2Err.Error(),
+	}
 }
 
 // bindingStrengthFor reports the strongest binding a host that already answered

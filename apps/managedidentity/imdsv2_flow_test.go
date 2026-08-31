@@ -29,6 +29,7 @@ import (
 
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/base"
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/base/storage"
+	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/oauth/ops"
 )
 
 // fakeKeyProvider hands out a software RSA key that reports itself as
@@ -109,6 +110,9 @@ type imdsFake struct {
 	serverHeader     string
 
 	metadataStatus int
+	computeBody    string
+	redirectTo     string
+	redirectStatus int
 	issueStatus    int
 
 	// issueFailures is the number of leading credential requests that fail with
@@ -245,8 +249,17 @@ func (f *imdsFake) writeServerHeader(w http.ResponseWriter) {
 }
 
 func (f *imdsFake) handleMetadata(w http.ResponseWriter, r *http.Request) {
+	if f.redirectTo != "" {
+		f.record("redirect")
+		http.Redirect(w, r, f.redirectTo, f.redirectStatus)
+		return
+	}
 	if strings.Contains(r.URL.Path, "issuecredential") {
 		f.handleIssue(w, r)
+		return
+	}
+	if strings.Contains(r.URL.Path, "/instance/compute") {
+		f.handleCompute(w, r)
 		return
 	}
 	// An IMDSv1 token request carries a resource but no cred-api-version.
@@ -287,9 +300,58 @@ func (f *imdsFake) handleMetadata(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleCompute serves the IMDSv1 instance compute document.
+//
+// It answers 404 by default. The document is only consulted when the v2 probe
+// reports a v1-only host, so a test that wants a v1 binding strength says so by
+// setting computeBody.
+func (f *imdsFake) handleCompute(w http.ResponseWriter, r *http.Request) {
+	f.record("compute")
+	f.writeServerHeader(w)
+	if r.Header.Get("Metadata") != "true" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if r.URL.Query().Get(apiVersionQueryParameterName) != imdsComputeAPIVersion {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if f.computeBody == "" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(f.computeBody))
+}
+
 func (f *imdsFake) handleIssue(w http.ResponseWriter, r *http.Request) {
 	f.record("issue")
 	f.writeServerHeader(w)
+	// Live IMDS rejects a request that omits these, so the fake does too.
+	// Without the check a mutation that drops setIMDSHeaders from
+	// issueCredential leaves every test green.
+	if r.Header.Get("Metadata") != "true" {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"bad_request","error_description":"the Metadata header is required"}`))
+		return
+	}
+	if r.Header.Get("x-ms-client-request-id") == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"bad_request","error_description":"a correlation ID is required"}`))
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		return
+	}
+	if r.URL.Query().Get("cred-api-version") != "2.0" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	// Two identities can now mint concurrently, so the fake's mutable state is
 	// guarded. The lock is not held across signing so the handlers still
 	// overlap, which is what the concurrency tests are asserting.
@@ -359,6 +421,22 @@ func (f *imdsFake) handleIssue(w http.ResponseWriter, r *http.Request) {
 func (f *imdsFake) handleToken(w http.ResponseWriter, r *http.Request) {
 	f.record("token")
 	_ = r.ParseForm()
+
+	// ESTS rejects a request missing any of these, so the fake does too.
+	// Without the check a mutation that drops one of the form fields from
+	// requestEntraToken leaves every test green.
+	for _, required := range []string{"client_id", "grant_type", "scope"} {
+		if r.Form.Get(required) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_request","error_description":"missing ` + required + `"}`))
+			return
+		}
+	}
+	if got := r.Form.Get("grant_type"); got != "client_credentials" {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"unsupported_grant_type","error_description":"` + got + `"}`))
+		return
+	}
 
 	f.mu.Lock()
 	f.lastTokenForm = r.Form
@@ -445,6 +523,7 @@ func withCleanCaches(t *testing.T) *fakePersistentCertCache {
 	clearAttestationCache()
 	clearMtlsClientCache()
 	clearCapabilitiesCache()
+	clearOrphanCheckCache()
 	cacheManager = storage.New(nil)
 	platformSupportsMtlsPoP = func() bool { return true }
 	// The real persistent cache is the user's own certificate store. A test
@@ -462,6 +541,7 @@ func withCleanCaches(t *testing.T) *fakePersistentCertCache {
 		clearAttestationCache()
 		clearMtlsClientCache()
 		clearCapabilitiesCache()
+		clearOrphanCheckCache()
 		cacheManager = storage.New(nil)
 		platformSupportsMtlsPoP = func() bool { return runtime.GOOS == "windows" }
 		retryWait = realWait
@@ -1424,6 +1504,130 @@ func TestIMDSv2RejectsNonHTTPSTokenEndpoint(t *testing.T) {
 		t.Fatalf("token endpoint = %q", got)
 	}
 }
+
+// The token endpoint is subject to the same parser differential as the
+// attestation endpoint: the string is parsed again by net/http when it dials,
+// so a value net/url and another parser read differently is one IMDS chooses
+// the meaning of. Whatever survives validation must be the bare origin that was
+// validated, and nothing that resolves elsewhere may survive at all.
+func TestIMDSv2RejectsAmbiguousTokenEndpointAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		endpoint string
+		// want is the URL the token leg must use, or empty when the endpoint
+		// has to be rejected.
+		want string
+	}{
+		{"backslash authority", `https:/\/\attacker.example`, ""},
+		{"single backslash", `https:/\attacker.example`, ""},
+		{"backslash after host", `https://mtlsauth.microsoft.com\@attacker.example`, ""},
+		{"userinfo host takeover", "https://mtlsauth.microsoft.com@attacker.example", ""},
+		{"no host", "https://", ""},
+		{"path is dropped", "https://mtlsauth.microsoft.com/../attacker.example", "https://mtlsauth.microsoft.com/tid/oauth2/v2.0/token"},
+		{"query is dropped", "https://mtlsauth.microsoft.com/?next=attacker.example", "https://mtlsauth.microsoft.com/tid/oauth2/v2.0/token"},
+		{"fragment is dropped", "https://mtlsauth.microsoft.com/#attacker.example", "https://mtlsauth.microsoft.com/tid/oauth2/v2.0/token"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			b := &bindingCertificate{Endpoint: test.endpoint, TenantID: "tid"}
+			got, err := b.tokenEndpoint()
+			if test.want == "" {
+				if err == nil {
+					t.Fatalf("endpoint %q was accepted as %q", test.endpoint, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("tokenEndpoint(): %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("token endpoint = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// A redirect on an IMDS leg is refused rather than followed.
+//
+// Go's default policy follows up to ten redirects, so nothing about this is
+// automatic. It matters because a 307 or 308 replays the request body, and on
+// the /issuecredential leg that body carries the CSR and the attestation
+// statement; a redirect on the token leg would present the binding certificate
+// to whatever host the redirect names. The https-only guarantee the endpoint
+// validation provides is worth nothing if the connection is then handed
+// somewhere else.
+func TestIMDSv2RefusesToFollowRedirects(t *testing.T) {
+	var reached int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&reached, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(attacker.Close)
+
+	for _, status := range []int{
+		http.StatusMovedPermanently,
+		http.StatusFound,
+		http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			atomic.StoreInt32(&reached, 0)
+			withCleanCaches(t)
+			fake := newIMDSFake(t)
+			fake.redirectTo = attacker.URL
+			fake.redirectStatus = status
+			client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+			_, err := client.AcquireToken(context.Background(), "https://vault.azure.net",
+				WithMtlsProofOfPossession())
+			if err == nil {
+				t.Fatal("AcquireToken succeeded through a redirect")
+			}
+			if !strings.Contains(err.Error(), "refusing to follow") {
+				t.Fatalf("error = %v, want the redirect refusal", err)
+			}
+			if n := atomic.LoadInt32(&reached); n != 0 {
+				t.Fatalf("the redirect target was reached %d times, and must never be reached", n)
+			}
+		})
+	}
+}
+
+// A caller who set CheckRedirect has stated a policy, and MSAL does not
+// silently replace explicit caller configuration. A client that is not an
+// *http.Client cannot be guarded at all and is passed through unchanged rather
+// than dropped.
+func TestIMDSRedirectGuardLeavesACallersPolicyAlone(t *testing.T) {
+	stated := func(*http.Request, []*http.Request) error { return nil }
+	caller := &http.Client{CheckRedirect: stated}
+	if got := imdsRedirectGuarded(caller); got != ops.HTTPClient(caller) {
+		t.Fatal("a caller's own redirect policy was replaced")
+	}
+
+	plain := &http.Client{}
+	guarded, ok := imdsRedirectGuarded(plain).(*http.Client)
+	if !ok {
+		t.Fatal("guarding an *http.Client did not return an *http.Client")
+	}
+	if guarded == plain {
+		t.Fatal("the caller's own client was mutated rather than copied")
+	}
+	if guarded.CheckRedirect == nil {
+		t.Fatal("no redirect policy was installed")
+	}
+	if plain.CheckRedirect != nil {
+		t.Fatal("the caller's client was given a policy it did not ask for")
+	}
+
+	other := notAnHTTPClient{}
+	if got := imdsRedirectGuarded(other); got != ops.HTTPClient(other) {
+		t.Fatal("a client that is not an *http.Client was not passed through")
+	}
+}
+
+type notAnHTTPClient struct{}
+
+func (notAnHTTPClient) Do(*http.Request) (*http.Response, error) { return nil, nil }
+func (notAnHTTPClient) CloseIdleConnections()                     {}
 
 // signerFor lets the CSR tests reuse a software key through the same interface
 // the flow uses.

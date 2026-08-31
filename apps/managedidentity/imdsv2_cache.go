@@ -5,6 +5,7 @@ package managedidentity
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"fmt"
 	"sync"
@@ -89,12 +90,14 @@ func cacheKey(id ID, attested bool) string {
 
 // identityKey renders the configured managed identity as a stable string.
 //
-// This is also the alias a persisted certificate is filed under, so it is the
-// value MSAL .NET uses rather than one of this library's choosing: the two
+// It is the base of the alias a persisted certificate is filed under, so it is
+// the value MSAL .NET uses rather than one of this library's choosing: the two
 // write the same name into the same store, which is what lets either of them
-// reuse a certificate the other issued. MSAL .NET takes the configured
-// identity verbatim, and names the system-assigned identity with the constant
-// reproduced here.
+// reuse a certificate the other issued. MSAL .NET takes the configured identity
+// verbatim, and names the system-assigned identity with the constant reproduced
+// here. The alias itself is cacheKey - this value with the attestation tag
+// appended - which is what MSAL .NET's GetMtlsCertCacheKey builds and hands to
+// its persistent cache.
 //
 // A client ID and an object ID are both GUIDs, so two clients configured with
 // the same string but different kinds share an alias. That is safe because the
@@ -305,6 +308,11 @@ func (c *bindingCertCache) adopt(key string, cert *bindingCertificate) {
 // private key behind it is gone, so the TLS handshake fails in a way that is
 // hard to attribute. Comparing the public keys detects it up front.
 func isOrphaned(cert *bindingCertificate, provider keyProvider) bool {
+	sum := sha256.Sum256(cert.Leaf.Raw)
+	key := string(sum[:])
+	if orphanCheckIsFresh(key) {
+		return false
+	}
 	current, err := provider.getOrCreateKey(bindingKeyName)
 	if err != nil {
 		// The key cannot be reached at all, so the cached certificate is not
@@ -312,7 +320,69 @@ func isOrphaned(cert *bindingCertificate, provider keyProvider) bool {
 		return true
 	}
 	defer func() { _ = current.Close() }()
-	return certificateMatchesKey(cert.Leaf, current) != nil
+	if certificateMatchesKey(cert.Leaf, current) != nil {
+		forgetOrphanCheck(key)
+		return true
+	}
+	recordOrphanCheck(key)
+	return false
+}
+
+// orphanCheckTTL is how long a healthy orphan check is trusted.
+//
+// isOrphaned sits on the token-cache fast path: an acquisition consults it
+// before reading the cache and again while acquiring. Each call opens the
+// provider, opens the key, proves the key can sign - a real RSA-2048 private-key
+// operation inside the VBS trustlet - exports two public blobs and frees two
+// objects. A service acquiring a token per inbound request would pay a trustlet
+// signature per request to answer a question whose answer only changes when the
+// isolated container is reset, which is a reboot-scale event.
+//
+// Only a healthy answer is cached, and only briefly. Trusting a stale healthy
+// answer costs one failed handshake, which shouldRemintCertificate recognises as
+// the binding key failing and repairs by reminting - the same recovery the
+// uncached path takes. An orphaned answer is never cached, because the caller
+// discards the certificate on the spot.
+const orphanCheckTTL = 30 * time.Second
+
+var orphanChecks = struct {
+	mu sync.Mutex
+	at map[string]time.Time
+}{at: map[string]time.Time{}}
+
+func orphanCheckIsFresh(key string) bool {
+	orphanChecks.mu.Lock()
+	defer orphanChecks.mu.Unlock()
+	at, ok := orphanChecks.at[key]
+	return ok && time.Since(at) < orphanCheckTTL
+}
+
+func recordOrphanCheck(key string) {
+	orphanChecks.mu.Lock()
+	defer orphanChecks.mu.Unlock()
+	// Each reminted certificate would otherwise leave an entry behind for the
+	// life of the process. Expired entries are dropped here rather than on a
+	// timer because the map only ever holds the few certificates checked within
+	// one window.
+	for k, at := range orphanChecks.at {
+		if time.Since(at) >= orphanCheckTTL {
+			delete(orphanChecks.at, k)
+		}
+	}
+	orphanChecks.at[key] = time.Now()
+}
+
+func forgetOrphanCheck(key string) {
+	orphanChecks.mu.Lock()
+	defer orphanChecks.mu.Unlock()
+	delete(orphanChecks.at, key)
+}
+
+// clearOrphanCheckCache discards every recorded orphan check.
+func clearOrphanCheckCache() {
+	orphanChecks.mu.Lock()
+	defer orphanChecks.mu.Unlock()
+	orphanChecks.at = map[string]time.Time{}
 }
 
 // bindingCertRefreshWindow is how long before its expiry a cached binding

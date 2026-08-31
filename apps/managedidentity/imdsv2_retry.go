@@ -131,6 +131,10 @@ var retryWait = func(ctx context.Context, d time.Duration) error {
 // for the in-memory body types this package uses; a request without one is sent
 // once rather than replayed empty.
 func sendIMDSRequest(ctx context.Context, client ops.HTTPClient, req *http.Request, retryEnabled bool, retriableStatus func(int) bool) (*http.Response, error) {
+	// Guarding here rather than at each construction site makes this the single
+	// choke point both plain-HTTP IMDS legs pass through, so a new leg cannot
+	// forget the refusal.
+	client = imdsRedirectGuarded(client)
 	if !retryEnabled {
 		return client.Do(req)
 	}

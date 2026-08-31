@@ -441,8 +441,74 @@ func TestCapabilitiesDoesNotRetryA404Probe(t *testing.T) {
 	if capabilities.MaxSupportedBindingStrength != MtlsBindingStrengthNone {
 		t.Fatalf("strength = %s, want None", capabilities.MaxSupportedBindingStrength)
 	}
-	if got := strings.Join(fake.calls, ","); got != "metadata" {
-		t.Fatalf("calls = %q, want one probe: a 404 says this host has no v2 endpoint", got)
+	if got := fake.countOf("metadata"); got != 1 {
+		t.Fatalf("probe requests = %d, want one: a 404 says this host has no v2 endpoint", got)
+	}
+}
+
+// A v1-only host still reports the binding strength its platform can reach, as
+// MSAL .NET does in DetermineImdsV1BindingStrengthAsync: it reads the instance
+// compute document and reports Software for a Windows VM whose security profile
+// is Trusted Launch or Confidential. Reporting None here would make the two
+// libraries disagree about the same machine.
+func TestCapabilitiesReportsSoftwareStrengthOnAV1OnlyWindowsHost(t *testing.T) {
+	for _, securityType := range []string{"TrustedLaunch", "confidentialvm"} {
+		t.Run(securityType, func(t *testing.T) {
+			withCleanCaches(t)
+			fake := newIMDSFake(t)
+			fake.metadataStatus = http.StatusNotFound
+			fake.computeBody = `{"osType":"Windows","securityProfile":{"securityType":"` + securityType + `"}}`
+			client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+			capabilities, err := client.Capabilities(context.Background())
+			if err != nil {
+				t.Fatalf("Capabilities: %v", err)
+			}
+			if capabilities.MaxSupportedBindingStrength != MtlsBindingStrengthSoftware {
+				t.Fatalf("strength = %s, want Software", capabilities.MaxSupportedBindingStrength)
+			}
+			if capabilities.Source != DefaultToIMDS {
+				t.Fatalf("source = %s, want %s", capabilities.Source, DefaultToIMDS)
+			}
+			// The host was described successfully, so there is nothing to report.
+			if capabilities.ErrorReason != "" {
+				t.Fatalf("ErrorReason = %q, want empty", capabilities.ErrorReason)
+			}
+			if fake.countOf("compute") == 0 {
+				t.Fatal("the compute document was never read")
+			}
+		})
+	}
+}
+
+// A security profile that cannot bind reports None, and a Linux host reports
+// None whatever its security type. MSAL .NET requires both conditions in
+// ComputeMetadataResponse.IsMtlsPopSupported, so a test that only varied one of
+// them would pass with either check missing.
+func TestCapabilitiesReportsNoStrengthForAV1OnlyHostThatCannotBind(t *testing.T) {
+	for name, body := range map[string]string{
+		"linux trusted launch": `{"osType":"Linux","securityProfile":{"securityType":"TrustedLaunch"}}`,
+		"windows standard":     `{"osType":"Windows","securityProfile":{"securityType":"Standard"}}`,
+		"windows no profile":   `{"osType":"Windows"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			withCleanCaches(t)
+			fake := newIMDSFake(t)
+			fake.metadataStatus = http.StatusNotFound
+			fake.computeBody = body
+			client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+			capabilities, err := client.Capabilities(context.Background())
+			if err != nil {
+				t.Fatalf("Capabilities: %v", err)
+			}
+			if capabilities.MaxSupportedBindingStrength != MtlsBindingStrengthNone {
+				t.Fatalf("strength = %s, want None", capabilities.MaxSupportedBindingStrength)
+			}
+			if capabilities.ErrorReason == "" {
+				t.Fatal("ErrorReason is empty: a host that cannot bind has to say why")
+			}
+		})
 	}
 }
 

@@ -63,6 +63,15 @@ var attestationLog struct {
 	lines []string
 }
 
+// attestationCallMu keeps one attestation at a time from drain to collection.
+//
+// attestationLog is process-wide because the native library's callback carries
+// no key or request identity, so two concurrent attestations would interleave
+// their diagnostics and each would report the other's lines as the reason it
+// failed. These lines are the only way to tell an MAA policy denial from a
+// missing TPM, so a wrong one is worse than none.
+var attestationCallMu sync.Mutex
+
 func recordAttestationLog(line string) {
 	attestationLog.mu.Lock()
 	defer attestationLog.mu.Unlock()
@@ -208,13 +217,23 @@ func attestKeyGuard(endpoint, clientID string, key bindingKey) (string, error) {
 		return "", fmt.Errorf("managedidentity: the client ID is not usable: %w", err)
 	}
 
+	// The native library writes its diagnostics into one process-wide buffer, so
+	// a concurrent attestation for another key would take the lines that explain
+	// this one's failure. attestation.go's gate only serializes callers that
+	// share a cache key, so the drain, the call, and the collection of the log
+	// are held together here.
+	attestationCallMu.Lock()
+	defer attestationCallMu.Unlock()
+
+	// The handle stays locked for the duration of the call. Sign holds the same
+	// lock for the same reason: without it Close could free the key while the
+	// trustlet is still using it.
 	signer.mu.Lock()
-	handle := signer.key
-	closed := signer.closed
-	signer.mu.Unlock()
-	if closed || handle == 0 {
+	defer signer.mu.Unlock()
+	if signer.closed || signer.key == 0 {
 		return "", fmt.Errorf("managedidentity: the binding key handle is already released")
 	}
+	handle := signer.key
 
 	drainAttestationLog()
 	// token is a *byte rather than a uintptr so the returned C string is never

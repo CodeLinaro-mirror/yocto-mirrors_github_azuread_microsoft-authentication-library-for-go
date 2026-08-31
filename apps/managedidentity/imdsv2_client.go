@@ -163,8 +163,18 @@ func (v imdsV2) getCsrMetadata(ctx context.Context, correlationID string) (csrMe
 	if err := json.Unmarshal(body, &metadata); err != nil {
 		return csrMetadata{}, fmt.Errorf("managedidentity: parsing platform metadata: %w", err)
 	}
-	if err := metadata.validate(); err != nil {
-		return csrMetadata{}, err
+	// A probe only asks whether this host serves IMDSv2, so it stops at a
+	// well-formed answer from something that identified itself as IMDS. MSAL
+	// .NET's probe does not read the body at all: it deliberately omits the
+	// Metadata header and treats the resulting 400 as proof the endpoint exists
+	// (ImdsManagedIdentitySource.ProbeImdsEndpointAsync). Applying the
+	// acquisition's content rules here would report a host as incapable over a
+	// field only an acquisition needs, and would do so non-definitively, so the
+	// probe would repeat on every retry interval for the life of the process.
+	if !v.probe {
+		if err := metadata.validate(); err != nil {
+			return csrMetadata{}, err
+		}
 	}
 	return metadata, nil
 }
@@ -330,6 +340,13 @@ func certificateMatchesKey(leaf *x509.Certificate, key bindingKey) error {
 // plaintext or point it at a non-TLS listener.
 func (b *bindingCertificate) tokenEndpoint() (string, error) {
 	raw := strings.TrimSuffix(b.Endpoint, "/")
+	// The same authority guards csrMetadata.attestationURL applies, for the same
+	// reason: this string is parsed again by net/http when it dials, so a value
+	// two parsers read differently is a value the service chooses the meaning
+	// of. Keep the two in step.
+	if strings.Contains(raw, `\`) {
+		return "", fmt.Errorf("managedidentity: IMDS returned an mTLS endpoint with a backslash in it %q", b.Endpoint)
+	}
 	if !strings.Contains(raw, "://") {
 		raw = "https://" + raw
 	}
@@ -342,6 +359,16 @@ func (b *bindingCertificate) tokenEndpoint() (string, error) {
 	}
 	if u.Hostname() == "" {
 		return "", fmt.Errorf("managedidentity: IMDS returned an mTLS endpoint with no host %q", b.Endpoint)
+	}
+	if u.Port() == "" && strings.Contains(u.Host, ":") {
+		return "", fmt.Errorf("managedidentity: IMDS returned an mTLS endpoint with a malformed authority %q", b.Endpoint)
+	}
+	// Userinfo makes the authority read one way to a person and another to a
+	// resolver: "https://mtlsauth.microsoft.com@attacker.example" dials
+	// attacker.example while looking like the real endpoint in a log. No real
+	// endpoint has it, so its presence is only ever an attempt to disguise one.
+	if u.User != nil {
+		return "", fmt.Errorf("managedidentity: IMDS returned an mTLS endpoint with userinfo in it %q", b.Endpoint)
 	}
 	// Anything the service put in the path, query or fragment is discarded: only
 	// the origin is taken from IMDS, and the rest of the URL is built here.
@@ -371,7 +398,16 @@ func mtlsHTTPClient(cert tls.Certificate) *http.Client {
 		return newMtlsHTTPClient(cert)
 	}
 	sum := sha256.Sum256(cert.Certificate[0])
-	key := string(sum[:])
+	// The key covers the signer, not just the certificate. The same DER can be
+	// paired with a new CNG handle after the previous one is closed: restore
+	// re-reads the stored certificate and provisions a fresh handle for it, and
+	// getBindingCertificate hands back a certificate that needs refreshing
+	// without adopting it, so the caller's Close frees that handle. Keying on
+	// the DER alone would return a cached client whose transport still holds the
+	// closed signer, and because the resulting transport error is not one
+	// shouldRemintCertificate matches, every later acquisition for that identity
+	// would fail the same way with nothing to repair it.
+	key := fmt.Sprintf("%x|%p", sum, cert.PrivateKey)
 
 	mtlsClientCache.mu.Lock()
 	defer mtlsClientCache.mu.Unlock()
@@ -407,13 +443,132 @@ func clearMtlsClientCache() {
 	}
 }
 
+// refuseIMDSv2Redirect refuses to follow a redirect on any IMDSv2 leg.
+//
+// A nil CheckRedirect is not "no policy": it is Go's default, which follows up
+// to 10 redirects. Every leg here sends a body built with strings.NewReader, so
+// net/http populates GetBody and a 307 or 308 replays that body verbatim at
+// whatever host the Location header names. On the issuecredential leg that body
+// carries the CSR and the MAA attestation statement; on the token leg the
+// cloned handshake would additionally present the binding certificate to the
+// redirect target. A redirect also voids the https-only guarantee that
+// bindingCertificate.tokenEndpoint and csrMetadata.attestationURL enforce,
+// because those validate the initial URL and cannot see where a redirect leads.
+//
+// Neither IMDS nor the mTLS token endpoint has a legitimate reason to redirect,
+// so inheriting Go's default trades a live credential for behavior nothing
+// depends on. This mirrors comm.refuseMtlsRedirect on the confidential client's
+// mTLS leg and the Service Fabric source's refusal in this package.
+func refuseIMDSv2Redirect(req *http.Request, via []*http.Request) error {
+	from := "an IMDSv2 endpoint"
+	if len(via) > 0 && via[len(via)-1].URL != nil {
+		from = via[len(via)-1].URL.Redacted()
+	}
+	return fmt.Errorf("managedidentity: the IMDSv2 request to %s was redirected to %s; refusing to follow it, because a 307 or 308 replays the request body - which carries the CSR and attestation statement, or the client credential - and a mutual-TLS handshake would present the binding certificate to the redirect target", from, req.URL.Redacted())
+}
+
+// imdsRedirectGuarded returns client with a redirect refusal installed, leaving
+// a caller who stated their own policy alone.
+//
+// The IMDS legs run on whatever ops.HTTPClient the caller supplied, so unlike
+// the mTLS client the refusal cannot be baked in at construction. A caller who
+// set CheckRedirect has stated a policy, and MSAL does not silently override
+// explicit caller configuration; a caller whose client is not an *http.Client
+// owns its redirect behavior entirely.
+func imdsRedirectGuarded(client ops.HTTPClient) ops.HTTPClient {
+	hc, ok := client.(*http.Client)
+	if !ok || hc == nil || hc.CheckRedirect != nil {
+		return client
+	}
+	derived := *hc
+	derived.CheckRedirect = refuseIMDSv2Redirect
+	return &derived
+}
+
+// imdsComputePath and imdsComputeAPIVersion address the instance compute
+// document. It is the only evidence available about a host that serves IMDSv1
+// only, and MSAL .NET reads the same path at the same version
+// (ImdsComputeMetadataManager.ImdsComputePath, .ImdsComputeApiVersion).
+const (
+	imdsComputePath       = "/metadata/instance/compute"
+	imdsComputeAPIVersion = "2021-02-01"
+)
+
+// computeMetadata is the part of the instance compute document that says
+// whether the host could bind a token to a key.
+type computeMetadata struct {
+	OsType          string `json:"osType"`
+	SecurityProfile struct {
+		SecurityType string `json:"securityType"`
+	} `json:"securityProfile"`
+}
+
+// supportsMtlsPoP reports whether the compute document describes a host that
+// can bind a token to a key: a Windows Trusted Launch or Confidential VM.
+//
+// This is MSAL .NET's ImdsComputeMetadataManager.IsMtlsPopSupported, including
+// its case-insensitive comparisons.
+func (m computeMetadata) supportsMtlsPoP() bool {
+	if !strings.EqualFold(m.OsType, "Windows") {
+		return false
+	}
+	return strings.EqualFold(m.SecurityProfile.SecurityType, "TrustedLaunch") ||
+		strings.EqualFold(m.SecurityProfile.SecurityType, "ConfidentialVM")
+}
+
+// getComputeMetadata reads the instance compute document.
+//
+// Unlike the IMDSv2 legs this takes no identity selector: the document
+// describes the machine, not an identity on it.
+func (v imdsV2) getComputeMetadata(ctx context.Context, correlationID string) (computeMetadata, error) {
+	u, err := url.Parse(v.baseEndpoint + imdsComputePath)
+	if err != nil {
+		return computeMetadata{}, fmt.Errorf("managedidentity: building the compute metadata URL: %w", err)
+	}
+	q := u.Query()
+	q.Set(apiVersionQueryParameterName, imdsComputeAPIVersion)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return computeMetadata{}, fmt.Errorf("managedidentity: building the compute metadata request: %w", err)
+	}
+	setIMDSHeaders(req, correlationID)
+
+	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled, imdsRetriableStatus)
+	if err != nil {
+		return computeMetadata{}, fmt.Errorf("managedidentity: requesting compute metadata: %w", err)
+	}
+	body, err := readIMDSResponse(resp)
+	if err != nil {
+		return computeMetadata{}, err
+	}
+	var m computeMetadata
+	if err := json.Unmarshal(body, &m); err != nil {
+		return computeMetadata{}, fmt.Errorf("managedidentity: parsing compute metadata: %w", err)
+	}
+	return m, nil
+}
+
 func newMtlsHTTPClient(cert tls.Certificate) *http.Client {
 	return &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout:       30 * time.Second,
+		CheckRedirect: refuseIMDSv2Redirect,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS12,
+				// GetClientCertificate rather than Certificates: Go filters
+				// Certificates against the certificate authorities the server
+				// advertises and silently sends nothing when none match. A
+				// binding certificate is issued by an internal CA the token
+				// endpoint has no reason to name, so the filter can drop it and
+				// the handshake then fails as an authentication error that does
+				// not name the real cause. This is the same reasoning the
+				// package documents for the caller-facing binding certificate
+				// in base.AuthResult.
+				GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+					return &cert, nil
+				},
+				MinVersion: tls.VersionTLS12,
 			},
 			ForceAttemptHTTP2:   true,
 			MaxIdleConns:        10,
@@ -427,7 +582,7 @@ func newMtlsHTTPClient(cert tls.Certificate) *http.Client {
 // connection authenticated by the binding certificate. When popRequested is
 // true the request asks for a certificate-bound token, otherwise it asks for an
 // ordinary bearer token that merely travelled over mTLS.
-func requestEntraToken(ctx context.Context, client *http.Client, binding *bindingCertificate, resource string, popRequested, retryEnabled bool) (accesstokens.TokenResponse, error) {
+func requestEntraToken(ctx context.Context, client *http.Client, binding *bindingCertificate, resource, claims string, popRequested, retryEnabled bool) (accesstokens.TokenResponse, error) {
 	target, err := binding.tokenEndpoint()
 	if err != nil {
 		return accesstokens.TokenResponse{}, err
@@ -437,6 +592,16 @@ func requestEntraToken(ctx context.Context, client *http.Client, binding *bindin
 	form.Set("client_id", binding.ClientID)
 	form.Set("grant_type", "client_credentials")
 	form.Set("scope", scopeForResource(resource))
+	if claims != "" {
+		// A claims challenge has to reach the service that issued it, or the
+		// caller retries forever against a token the resource keeps refusing.
+		// MSAL .NET emits claims on this leg through TokenClient's
+		// ClaimsAndClientCapabilities (ManagedIdentityAuthRequest, "Server-issued
+		// claims and client capabilities are emitted automatically by
+		// TokenClient"), so a conditional-access or revocation challenge is
+		// answerable on the mTLS path there and must be here too.
+		form.Set("claims", claims)
+	}
 	if popRequested {
 		form.Set("token_type", authority.AccessTokenTypeMtlsPoP)
 	} else {

@@ -317,8 +317,46 @@ func keyCanSign(key windows.Handle) bool {
 	return status == 0
 }
 
+// bindingKeyGates serializes provisioning of a CNG container.
+//
+// The container is process-wide - one name, shared by every identity - while
+// bindingCertCache's gate is keyed by identity and attestation mode. Two
+// identities therefore take different certificate gates and would provision the
+// same container concurrently. createPersistedKey passes
+// NCRYPT_OVERWRITE_KEY_FLAG, and because the key is per-boot keyCanSign fails
+// for every identity after a reboot, so concurrent first calls are guaranteed to
+// both take the create-and-overwrite branch. The loser's freshly issued
+// certificate would then be bound to a key that no longer exists, costing a
+// second /issuecredential call against a rate-limited service, and the overwrite
+// can invalidate a handle another goroutine already holds. This is the
+// key-provisioning counterpart of the gate attestation.go takes for the same
+// process-wide reason.
+//
+// A plain mutex is right here where the attestation gate is a cancellable
+// channel: everything under this lock is a local CNG call, so the wait is
+// bounded by the trustlet rather than by a network round trip.
+var bindingKeyGates = struct {
+	mu    sync.Mutex
+	gates map[string]*sync.Mutex
+}{gates: map[string]*sync.Mutex{}}
+
+func bindingKeyGate(name string) *sync.Mutex {
+	bindingKeyGates.mu.Lock()
+	defer bindingKeyGates.mu.Unlock()
+	gate, ok := bindingKeyGates.gates[name]
+	if !ok {
+		gate = &sync.Mutex{}
+		bindingKeyGates.gates[name] = gate
+	}
+	return gate
+}
+
 // getOrCreateKey returns the binding key called name, creating it when absent.
 func (keyGuardProvider) getOrCreateKey(name string) (bindingKey, error) {
+	gate := bindingKeyGate(name)
+	gate.Lock()
+	defer gate.Unlock()
+
 	keyName, err := windows.UTF16PtrFromString(name)
 	if err != nil {
 		return bindingKey{}, fmt.Errorf("managedidentity: encoding the key name: %w", err)
@@ -516,7 +554,7 @@ func (s *ncryptSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil, fmt.Errorf("managedidentity: the binding key is closed")
+		return nil, fmt.Errorf("%s: the key is closed", bindingKeySignFailureMarker)
 	}
 
 	var padInfo unsafe.Pointer
@@ -555,7 +593,7 @@ func (s *ncryptSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 		0, 0, uintptr(unsafe.Pointer(&needed)), flags|ncryptSilentFlag,
 	)
 	if status != 0 {
-		return nil, ncryptStatusError("NCryptSignHash(size)", status)
+		return nil, fmt.Errorf("%s: %w", bindingKeySignFailureMarker, ncryptStatusError("NCryptSignHash(size)", status))
 	}
 	signature := make([]byte, needed)
 	status, _, _ = syscall.SyscallN(procNCryptSignHash.Addr(),
@@ -565,7 +603,7 @@ func (s *ncryptSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 		uintptr(unsafe.Pointer(&needed)), flags|ncryptSilentFlag,
 	)
 	if status != 0 {
-		return nil, ncryptStatusError("NCryptSignHash", status)
+		return nil, fmt.Errorf("%s: %w", bindingKeySignFailureMarker, ncryptStatusError("NCryptSignHash", status))
 	}
 	return signature[:needed], nil
 }

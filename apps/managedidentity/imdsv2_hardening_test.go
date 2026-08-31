@@ -15,7 +15,6 @@ import (
 	"errors"
 	"io"
 	"math/big"
-	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -459,47 +458,65 @@ func TestIMDSv2NormalizesAttestationEndpointToTheValidatedOrigin(t *testing.T) {
 	// the string that happened to pass validation: a parser that folds
 	// backslashes to slashes reads "https:/\/\attacker.example" as
 	// attacker.example, while net/url reads its host as "https". Returning the
-	// rebuilt origin closes that gap. Each case below must never reach the
-	// native library carrying the attacker's host.
+	// rebuilt origin closes that gap.
+	//
+	// Every case states which of the two defences is meant to catch it. An
+	// endpoint with no host at all never reaches the native library, and one
+	// that does reach it must arrive as the bare origin. Without that
+	// distinction the test passes when attestation is skipped entirely, which
+	// hides a change that stops normalizing and starts rejecting instead.
 	for _, test := range []struct {
 		name     string
 		endpoint string
+		// want is the exact origin the native library must be handed, or empty
+		// when the endpoint has to be rejected before it gets there.
+		want string
 	}{
-		{"backslash authority", `https:/\/\attacker.example`},
-		{"single backslash", `https:/\attacker.example`},
-		{"path is dropped", "https://attestation.example/../attacker.example"},
-		{"query is dropped", "https://attestation.example/?next=attacker.example"},
-		{"fragment is dropped", "https://attestation.example/#attacker.example"},
+		{"backslash authority", `https:/\/\attacker.example`, ""},
+		{"single backslash", `https:/\attacker.example`, ""},
+		{"userinfo host takeover", "https://attestation.example@attacker.example", ""},
+		{"path is dropped", "https://attestation.example/../attacker.example", "https://attestation.example"},
+		{"query is dropped", "https://attestation.example/?next=attacker.example", "https://attestation.example"},
+		{"fragment is dropped", "https://attestation.example/#attacker.example", "https://attestation.example"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			withCleanCaches(t)
 			fake := newIMDSFake(t)
 			fake.attestationEndpoint = test.endpoint
 			var seen string
+			var attested bool
 			original := attestKeyGuardFn
 			attestKeyGuardFn = func(endpoint, clientID string, key bindingKey) (string, error) {
 				seen = endpoint
+				attested = true
 				return stubAttestationJWT(t, time.Now().Add(time.Hour)), nil
 			}
 			t.Cleanup(func() { attestKeyGuardFn = original })
 			client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
 
-			// Whether the acquisition succeeds is not the point; an endpoint
-			// that survives validation but resolves somewhere else is.
-			_, _ = client.AcquireToken(context.Background(), "https://vault.azure.net",
+			_, err := client.AcquireToken(context.Background(), "https://vault.azure.net",
 				WithMtlsProofOfPossession(), WithAttestationSupport())
 
 			if strings.Contains(seen, "attacker.example") {
 				t.Fatalf("the native library was handed %q, which carries the attacker's host", seen)
 			}
-			if seen != "" {
-				u, err := url.Parse(seen)
-				if err != nil {
-					t.Fatalf("the native library was handed an unparseable endpoint %q: %v", seen, err)
+			if test.want == "" {
+				if attested {
+					t.Fatalf("the native library was called with %q, but an endpoint with no host must be rejected first", seen)
 				}
-				if want := "https://" + u.Host; seen != want {
-					t.Fatalf("endpoint = %q, want the bare validated origin %q", seen, want)
+				if err == nil {
+					t.Fatal("AcquireToken succeeded, but an unusable attestation endpoint has to fail the acquisition")
 				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("AcquireToken: %v", err)
+			}
+			if !attested {
+				t.Fatal("the native library was never called, so nothing about the endpoint it receives was proven")
+			}
+			if seen != test.want {
+				t.Fatalf("endpoint = %q, want the bare validated origin %q", seen, test.want)
 			}
 		})
 	}
