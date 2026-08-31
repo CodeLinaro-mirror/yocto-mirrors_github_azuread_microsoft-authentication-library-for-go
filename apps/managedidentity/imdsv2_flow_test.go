@@ -699,18 +699,44 @@ func withCountedAttestation(t *testing.T, tokenFor func() string) *int {
 	return &calls
 }
 
-// The scope sent on leg 3 is built the way MSAL .NET builds it, so a caller
-// that writes the resource with a trailing slash, or already as a scope, gets
-// the same single "/.default" .NET would send.
+// The scope sent on leg 3 has to match what MSAL .NET sends for the same
+// resource, since the two libraries acquire tokens for the same resources from
+// the same endpoint.
+//
+// .NET's public entry point documents the resource as "{ResourceIdUri}" or
+// "{ResourceIdUri/.default}"
+// (IManagedIdentityApplication.AcquireTokenForManagedIdentity) and normalizes
+// it in two steps: ScopeHelper.RemoveDefaultSuffixIfPresent at the API
+// boundary, then resource.TrimEnd('/') + "/.default" when it builds the request
+// (ManagedIdentityAuthRequest). netScopeForResource reproduces both, so this
+// compares the two libraries rather than restating what Go already does.
 func TestScopeForResourceMatchesDotNet(t *testing.T) {
-	for _, test := range []struct{ resource, want string }{
-		{"https://vault.azure.net", "https://vault.azure.net/.default"},
-		{"https://vault.azure.net/", "https://vault.azure.net/.default"},
-		{"https://vault.azure.net//", "https://vault.azure.net/.default"},
-		{"https://vault.azure.net/.default", "https://vault.azure.net/.default"},
+	netScopeForResource := func(resource string) string {
+		const suffix = "/.default"
+		if strings.HasSuffix(resource, suffix) {
+			resource = resource[:strings.LastIndex(resource, suffix)]
+		}
+		return strings.TrimRight(resource, "/") + suffix
+	}
+	for _, resource := range []string{
+		"https://vault.azure.net",
+		"https://vault.azure.net/",
+		"https://vault.azure.net//",
+		"https://vault.azure.net/.default",
+		"https://vault.azure.net/.default/",
+		"https://graph.microsoft.com/.default",
+		"https://management.azure.com",
+		"api://00000000-0000-0000-0000-000000000000",
+		"api://00000000-0000-0000-0000-000000000000/.default",
+		"https://host/path",
+		"https://host/path/.default",
+		"https://vault.azure.net/.Default",
 	} {
-		if got := scopeForResource(test.resource); got != test.want {
-			t.Errorf("scopeForResource(%q) = %q, want %q", test.resource, got, test.want)
+		// AcquireToken strips the suffix at the API boundary, which is exactly
+		// where .NET's builder strips it, so the comparison starts there.
+		got := scopeForResource(strings.TrimSuffix(resource, "/.default"))
+		if want := netScopeForResource(resource); got != want {
+			t.Errorf("scope for %q = %q, .NET sends %q", resource, got, want)
 		}
 	}
 }

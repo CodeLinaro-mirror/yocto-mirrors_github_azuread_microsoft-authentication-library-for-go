@@ -683,11 +683,17 @@ func requestEntraToken(ctx context.Context, client *http.Client, binding *bindin
 
 // scopeForResource turns a resource into the scope the v2 endpoint expects.
 //
-// MSAL .NET builds this as resource.TrimEnd('/') + "/.default", so the trailing
-// slash has to go or a caller passing "https://vault.azure.net/" would ask for a
-// double-slashed scope. The suffix is also trimmed first, which .NET does not
-// do, so that a resource already written as a scope is not given a second
-// "/.default".
+// MSAL .NET builds this as resource.TrimEnd('/') + "/.default"
+// (ManagedIdentityAuthRequest, the IMDSv2 token leg), so the trailing slash has
+// to go or a caller passing "https://vault.azure.net/" would ask for a
+// double-slashed scope.
+//
+// .NET strips an existing "/.default" too, just earlier: its public entry point
+// documents the resource as "{ResourceIdUri}" or "{ResourceIdUri/.default}" and
+// runs ScopeHelper.RemoveDefaultSuffixIfPresent at the API boundary
+// (AcquireTokenForManagedIdentityParameterBuilder.WithResource), which is the
+// same place AcquireToken strips it here. The repeat below is belt and braces
+// for a caller that reaches this function by another route.
 func scopeForResource(resource string) string {
 	resource = strings.TrimSuffix(resource, "/.default")
 	resource = strings.TrimRight(resource, "/")
