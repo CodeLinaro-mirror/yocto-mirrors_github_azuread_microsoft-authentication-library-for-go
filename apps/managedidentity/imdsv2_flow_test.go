@@ -110,6 +110,10 @@ type imdsFake struct {
 	metadataStatus int
 	issueStatus    int
 
+	// issueFailures is the number of leading credential requests that fail with
+	// a retriable status before one succeeds.
+	issueFailures int
+
 	// tokenFailures is the number of leading token requests that fail with
 	// tokenFailureBody before one succeeds.
 	tokenFailures    int
@@ -173,7 +177,8 @@ func newIMDSFake(t *testing.T) *imdsFake {
 		tokenType:      "mtls_pop",
 
 		// Comfortably outside bindingCertRefreshWindow, so the default fixture
-		// certificate is cacheable; a test that wants a stale one sets its own.
+		// certificate is cacheable and reusable. A test that wants to drive the
+		// refresh window sets this shorter.
 		certLifetime:        30 * 24 * time.Hour,
 		attestationEndpoint: "https://attestation.example",
 	}
@@ -263,6 +268,11 @@ func (f *imdsFake) handleMetadata(w http.ResponseWriter, r *http.Request) {
 func (f *imdsFake) handleIssue(w http.ResponseWriter, r *http.Request) {
 	f.record("issue")
 	f.writeServerHeader(w)
+	if f.issueFailures > 0 {
+		f.issueFailures--
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	if f.issueStatus != http.StatusOK {
 		w.WriteHeader(f.issueStatus)
 		_, _ = w.Write([]byte(`{"error":"bad_request","error_description":"nope"}`))
@@ -359,7 +369,7 @@ func (f *imdsFake) handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 // newTestClient builds a managed identity client wired to the fake.
-func (f *imdsFake) newTestClient(t *testing.T, id ID, provider keyProvider) Client {
+func (f *imdsFake) newTestClient(t *testing.T, id ID, provider keyProvider, opts ...ClientOption) Client {
 	t.Helper()
 	t.Setenv(identityEndpointEnvVar, "")
 	t.Setenv(msiEndpointEnvVar, "")
@@ -369,7 +379,7 @@ func (f *imdsFake) newTestClient(t *testing.T, id ID, provider keyProvider) Clie
 	t.Setenv(identityServerThumbprintEnvVar, "")
 	t.Setenv(azurePodIdentityAuthorityHostEnvVar, f.metadataServer.URL)
 
-	client, err := New(id, WithHTTPClient(f.metadataServer.Client()))
+	client, err := New(id, append([]ClientOption{WithHTTPClient(f.metadataServer.Client())}, opts...)...)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -401,12 +411,18 @@ func withCleanCaches(t *testing.T) {
 	clearMtlsClientCache()
 	cacheManager = storage.New(nil)
 	platformSupportsMtlsPoP = func() bool { return true }
+	// The retry schedule is real time. Tests that exercise a retriable status
+	// would otherwise wait out the backoff, so the wait is recorded rather than
+	// served. A test that cares about the schedule installs its own.
+	realWait := imdsRetryWait
+	imdsRetryWait = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
 	t.Cleanup(func() {
 		certCache.clear()
 		clearAttestationCache()
 		clearMtlsClientCache()
 		cacheManager = storage.New(nil)
 		platformSupportsMtlsPoP = func() bool { return runtime.GOOS == "windows" }
+		imdsRetryWait = realWait
 	})
 }
 
@@ -887,6 +903,57 @@ func TestIMDSv2ReportsV1OnlyHost(t *testing.T) {
 	_, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession())
 	if !errors.Is(err, ErrMtlsPoPNotSupportedInIMDSv1) {
 		t.Fatalf("error = %v, want ErrMtlsPoPNotSupportedInIMDSv1", err)
+	}
+}
+
+// A 404 is the answer that decides IMDSv2 is unavailable on this host, so it is
+// only believed once the retries are exhausted. An agent that is still starting
+// can answer 404 briefly, and treating that as a permanent capability answer
+// would fall back to IMDSv1 for the life of the process.
+func TestIMDSv2RetriesA404BeforeReportingAV1OnlyHost(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.metadataStatus = http.StatusNotFound
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	_, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession())
+	if !errors.Is(err, ErrMtlsPoPNotSupportedInIMDSv1) {
+		t.Fatalf("error = %v, want ErrMtlsPoPNotSupportedInIMDSv1", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "metadata,metadata,metadata,metadata" {
+		t.Errorf("calls = %q, want the 404 retried three times before it is believed", got)
+	}
+}
+
+// The retry policy is wired to the client option rather than always on.
+func TestIMDSv2HonorsWithRetryPolicyDisabled(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.metadataStatus = http.StatusNotFound
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider(), WithRetryPolicyDisabled())
+
+	_, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession())
+	if !errors.Is(err, ErrMtlsPoPNotSupportedInIMDSv1) {
+		t.Fatalf("error = %v, want ErrMtlsPoPNotSupportedInIMDSv1", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "metadata" {
+		t.Errorf("calls = %q, want a single attempt when the retry policy is disabled", got)
+	}
+}
+
+// A transient failure on the credential leg is retried, and the retried POST
+// still carries a usable CSR: the fake would fail to parse an empty body.
+func TestIMDSv2RetriesTheCredentialLeg(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.issueFailures = 2
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	if _, err := client.AcquireToken(context.Background(), "https://vault.azure.net", WithMtlsProofOfPossession()); err != nil {
+		t.Fatalf("AcquireToken: %v", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "metadata,issue,issue,issue,token" {
+		t.Errorf("calls = %q, want the credential request retried twice and then succeed", got)
 	}
 }
 

@@ -44,6 +44,9 @@ type imdsV2 struct {
 	httpClient  ops.HTTPClient
 	keyProvider keyProvider
 	miType      ID
+	// retryEnabled carries the client's WithRetryPolicyDisabled setting to the
+	// two IMDS legs, which retry on their own rather than through Client.retry.
+	retryEnabled bool
 	// baseEndpoint is the IMDS root. It is a field so tests can point the two
 	// plain-HTTP legs at a local server.
 	baseEndpoint string
@@ -113,13 +116,14 @@ func (v imdsV2) getCsrMetadata(ctx context.Context, correlationID string) (csrMe
 	}
 	setIMDSHeaders(req, correlationID)
 
-	resp, err := v.httpClient.Do(req)
+	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled)
 	if err != nil {
 		return csrMetadata{}, fmt.Errorf("managedidentity: requesting platform metadata: %w", err)
 	}
 	// A host that serves IMDSv1 only has no platform metadata endpoint at all.
-	// That is a capability answer rather than a transient failure, so it is
-	// reported as such instead of being retried.
+	// That is a capability answer rather than a transient failure. The retries
+	// above have already run, so a 404 that reaches here is the host's settled
+	// answer rather than an agent that had not finished starting.
 	if resp.StatusCode == http.StatusNotFound {
 		resp.Body.Close()
 		return csrMetadata{}, ErrMtlsPoPNotSupportedInIMDSv1
@@ -163,7 +167,7 @@ func (v imdsV2) issueCredential(ctx context.Context, correlationID, csr, attesta
 	setIMDSHeaders(req, correlationID)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := v.httpClient.Do(req)
+	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled)
 	if err != nil {
 		return certificateRequestResponse{}, fmt.Errorf("managedidentity: requesting a credential: %w", err)
 	}

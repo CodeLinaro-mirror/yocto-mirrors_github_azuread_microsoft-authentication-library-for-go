@@ -117,6 +117,7 @@ func (c Client) acquireTokenForIMDSv2(ctx context.Context, resource string, o Ac
 		httpClient:   c.httpClient,
 		keyProvider:  c.bindingKeyProvider(),
 		miType:       c.miType,
+		retryEnabled: c.retryPolicyEnabled,
 		baseEndpoint: imdsV2BaseEndpoint(),
 	}
 
