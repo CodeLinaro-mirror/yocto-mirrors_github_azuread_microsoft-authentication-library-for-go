@@ -53,6 +53,23 @@ func imdsRetriableStatus(status int) bool {
 	return status >= 500 && status <= 599
 }
 
+// imdsProbeRetriableStatus reports whether a capability probe should be
+// retried. It mirrors HttpRetryConditions.ImdsProbe in MSAL .NET: the same
+// answers as the acquisition path, except that a 404 is taken at face value.
+//
+// The two differ because they are asking different questions. An acquisition
+// has been told to use IMDSv2, so a 404 contradicts the caller and is worth
+// re-checking in case the agent is still starting. A probe is asking whether
+// this host serves v2 at all, and "no" is a perfectly good answer: retrying it
+// cannot change a v1-only host into a v2 host, and only makes every caller on
+// such a host wait out the full backoff before hearing it.
+func imdsProbeRetriableStatus(status int) bool {
+	if status == http.StatusNotFound {
+		return false
+	}
+	return imdsRetriableStatus(status)
+}
+
 // retriableTransportError reports whether a transport-level failure should be
 // retried. MSAL .NET retries exactly one exception here, TaskCanceledException,
 // which is what its HTTP client raises on a timeout; the Go equivalent is a
@@ -103,11 +120,15 @@ var retryWait = func(ctx context.Context, d time.Duration) error {
 // transient. It returns the last response received, so the caller applies its
 // own meaning to a status that survived the retries.
 //
+// retriableStatus selects the policy. MSAL .NET picks one the same way, through
+// RetryPolicyFactory: RequestType.Imds for an acquisition and
+// RequestType.ImdsProbe for capability discovery.
+//
 // req is cloned per attempt and its body rewound from GetBody, because a body
 // is consumed by the attempt that sent it. http.NewRequest populates GetBody
 // for the in-memory body types this package uses; a request without one is sent
 // once rather than replayed empty.
-func sendIMDSRequest(ctx context.Context, client ops.HTTPClient, req *http.Request, retryEnabled bool) (*http.Response, error) {
+func sendIMDSRequest(ctx context.Context, client ops.HTTPClient, req *http.Request, retryEnabled bool, retriableStatus func(int) bool) (*http.Response, error) {
 	if !retryEnabled {
 		return client.Do(req)
 	}
@@ -138,7 +159,7 @@ func sendIMDSRequest(ctx context.Context, client ops.HTTPClient, req *http.Reque
 				maxRetries = imdsExponentialRetries
 			}
 		default:
-			retriable = imdsRetriableStatus(resp.StatusCode)
+			retriable = retriableStatus(resp.StatusCode)
 			if maxRetries < 0 {
 				maxRetries = imdsExponentialRetries
 				if resp.StatusCode == http.StatusGone {

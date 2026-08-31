@@ -6,6 +6,7 @@ package managedidentity
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -416,5 +417,67 @@ func TestForceRefreshKeepsBindingCertificate(t *testing.T) {
 	if fake.countOf("issue") != issued {
 		t.Fatalf("credential requests = %d, want %d: a forced token refresh must not re-mint the certificate",
 			fake.countOf("issue"), issued)
+	}
+}
+
+// Capability discovery uses a different retry policy from an acquisition, as
+// MSAL .NET does with HttpRetryConditions.ImdsProbe. A 404 answers the question
+// the probe is asking, so it is believed immediately: retrying cannot turn a
+// v1-only host into a v2 host, and the backoff would be charged to every caller
+// on such a host. TestIMDSv2RetriesA404BeforeReportingAV1OnlyHost pins the
+// opposite behavior for the acquisition path, which contradicts the caller and
+// so is worth re-checking.
+func TestCapabilitiesDoesNotRetryA404Probe(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.metadataStatus = http.StatusNotFound
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	capabilities, err := client.Capabilities(context.Background())
+	if err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	if capabilities.MaxSupportedBindingStrength != MtlsBindingStrengthNone {
+		t.Fatalf("strength = %s, want None", capabilities.MaxSupportedBindingStrength)
+	}
+	if got := strings.Join(fake.calls, ","); got != "metadata" {
+		t.Fatalf("calls = %q, want one probe: a 404 says this host has no v2 endpoint", got)
+	}
+}
+
+// Narrowing the probe policy must not turn it into no policy. A 500 is still a
+// transient failure that says nothing about whether the host serves v2, so the
+// probe retries it exactly as an acquisition would.
+func TestCapabilitiesRetriesATransientProbeFailure(t *testing.T) {
+	withCleanCaches(t)
+	fake := newIMDSFake(t)
+	fake.metadataStatus = http.StatusInternalServerError
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	if _, err := client.Capabilities(context.Background()); err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "metadata,metadata,metadata,metadata" {
+		t.Fatalf("calls = %q, want a 500 retried three times", got)
+	}
+}
+
+// The two policies differ in exactly one status code. Anything else drifting
+// apart would be a divergence from MSAL .NET rather than a deliberate choice.
+func TestProbeRetryPolicyDiffersFromAcquisitionOnlyOn404(t *testing.T) {
+	for status := 100; status < 600; status++ {
+		want := imdsRetriableStatus(status)
+		if status == http.StatusNotFound {
+			want = false
+		}
+		if got := imdsProbeRetriableStatus(status); got != want {
+			t.Errorf("imdsProbeRetriableStatus(%d) = %t, want %t", status, got, want)
+		}
+	}
+	if imdsProbeRetriableStatus(http.StatusNotFound) {
+		t.Error("the probe must not retry a 404")
+	}
+	if !imdsRetriableStatus(http.StatusNotFound) {
+		t.Error("the acquisition path must still retry a 404")
 	}
 }

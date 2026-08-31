@@ -194,6 +194,7 @@ func (c Client) discoverCapabilities(ctx context.Context) Capabilities {
 		miType:       c.miType,
 		retryEnabled: c.retryPolicyEnabled,
 		baseEndpoint: imdsV2BaseEndpoint(),
+		probe:        true,
 	}
 	if _, err := v.getCsrMetadata(ctx, newCorrelationID()); err != nil {
 		return Capabilities{

@@ -55,6 +55,18 @@ type imdsV2 struct {
 	// baseEndpoint is the IMDS root. It is a field so tests can point the two
 	// plain-HTTP legs at a local server.
 	baseEndpoint string
+	// probe marks this as a capability probe rather than an acquisition, which
+	// selects the retry policy for the metadata leg. MSAL .NET draws the same
+	// distinction with RequestType.ImdsProbe.
+	probe bool
+}
+
+// metadataRetriableStatus returns the retry policy for the metadata leg.
+func (v imdsV2) metadataRetriableStatus() func(int) bool {
+	if v.probe {
+		return imdsProbeRetriableStatus
+	}
+	return imdsRetriableStatus
 }
 
 // endpoint builds an IMDS URL with the api version and any user-assigned
@@ -121,14 +133,17 @@ func (v imdsV2) getCsrMetadata(ctx context.Context, correlationID string) (csrMe
 	}
 	setIMDSHeaders(req, correlationID)
 
-	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled)
+	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled, v.metadataRetriableStatus())
 	if err != nil {
 		return csrMetadata{}, fmt.Errorf("managedidentity: requesting platform metadata: %w", err)
 	}
-	// A host that serves IMDSv1 only has no platform metadata endpoint at all.
-	// That is a capability answer rather than a transient failure. The retries
-	// above have already run, so a 404 that reaches here is the host's settled
-	// answer rather than an agent that had not finished starting.
+	// A host that serves IMDSv1 only has no platform metadata endpoint at all,
+	// which is a capability answer rather than a transient failure. On the
+	// acquisition path the retries above have already run, so a 404 reaching
+	// here is the host's settled answer rather than an agent that had not
+	// finished starting. A probe does not retry a 404 at all, because it is
+	// asking whether the endpoint exists and has just been told that it does
+	// not.
 	if resp.StatusCode == http.StatusNotFound {
 		resp.Body.Close()
 		return csrMetadata{}, ErrMtlsPoPNotSupportedInIMDSv1
@@ -172,7 +187,7 @@ func (v imdsV2) issueCredential(ctx context.Context, correlationID, csr, attesta
 	setIMDSHeaders(req, correlationID)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled)
+	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled, imdsRetriableStatus)
 	if err != nil {
 		return certificateRequestResponse{}, fmt.Errorf("managedidentity: requesting a credential: %w", err)
 	}

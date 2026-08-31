@@ -95,7 +95,7 @@ func TestSendIMDSRequestRetriesATransientStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, true)
+	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, true, imdsRetriableStatus)
 	if err != nil {
 		t.Fatalf("sendIMDSRequest: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestSendIMDSRequestStopsAfterThreeRetries(t *testing.T) {
 	defer srv.Close()
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
-	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, true)
+	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, true, imdsRetriableStatus)
 	if err != nil {
 		t.Fatalf("sendIMDSRequest: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestSendIMDSRequestGoneUsesTheLinearSchedule(t *testing.T) {
 	defer srv.Close()
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
-	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, true)
+	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, true, imdsRetriableStatus)
 	if err != nil {
 		t.Fatalf("sendIMDSRequest: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestSendIMDSRequestKeepsTheBudgetFromTheFirstStatus(t *testing.T) {
 	defer srv.Close()
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
-	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, true)
+	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, true, imdsRetriableStatus)
 	if err != nil {
 		t.Fatalf("sendIMDSRequest: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestSendIMDSRequestRewindsTheBodyOnRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := sendIMDSRequest(context.Background(), client, req, true)
+	resp, err := sendIMDSRequest(context.Background(), client, req, true, imdsRetriableStatus)
 	if err != nil {
 		t.Fatalf("sendIMDSRequest: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestSendIMDSRequestDoesNotRetryANonRetriableStatus(t *testing.T) {
 	defer srv.Close()
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
-	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, true)
+	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, true, imdsRetriableStatus)
 	if err != nil {
 		t.Fatalf("sendIMDSRequest: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestSendIMDSRequestHonorsADisabledRetryPolicy(t *testing.T) {
 	defer srv.Close()
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
-	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, false)
+	resp, err := sendIMDSRequest(context.Background(), srv.Client(), req, false, imdsRetriableStatus)
 	if err != nil {
 		t.Fatalf("sendIMDSRequest: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestSendIMDSRequestDoesNotRetryACanceledContext(t *testing.T) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
 	cancel()
 
-	if _, err := sendIMDSRequest(ctx, srv.Client(), req, true); err == nil {
+	if _, err := sendIMDSRequest(ctx, srv.Client(), req, true, imdsRetriableStatus); err == nil {
 		t.Fatal("sendIMDSRequest succeeded on a canceled context")
 	}
 	if fake.calls > 1 {
