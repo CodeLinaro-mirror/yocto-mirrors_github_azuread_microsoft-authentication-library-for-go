@@ -214,17 +214,85 @@ stages:
                 if (-not (Test-Path "$native\AttestationClientLib.dll")) {
                   throw "AttestationClientLib.dll was not found in the package"
                 }
-                # Deliberately not published on PATH. The library is loaded with
-                # LoadLibraryEx and LOAD_LIBRARY_SEARCH_* flags, which replace the
-                # standard search order, so neither PATH nor the working directory
-                # is consulted; that is what stops a writable PATH entry from
-                # injecting native code into a process holding managed identity
-                # tokens and a live KeyGuard key handle. Publishing this directory
-                # on PATH therefore leaves the file present but unloadable. Hand
-                # the directory to the test step instead, which copies it next to
-                # the test binary - the application directory the loader does
-                # search, and the same deployment shape a real Go service uses.
-                Write-Host "##vso[task.setvariable variable=kgAttNativeDir]$native"
+                # Assemble everything the test step must place next to the test
+                # binary. The library is loaded with LoadLibraryEx and
+                # LOAD_LIBRARY_SEARCH_* flags, which replace the standard search
+                # order, so PATH is never consulted - neither for the library
+                # itself nor for the dependencies it imports. Publishing this
+                # directory on PATH leaves the files present but unloadable,
+                # which is exactly how this stage failed before.
+                $payload = "$dir\payload"
+                if (Test-Path $payload) { Remove-Item -Recurse -Force $payload }
+                New-Item -ItemType Directory -Force -Path $payload | Out-Null
+                Copy-Item "$native\AttestationClientLib.dll" $payload -Force
+                # AttestationClientLib.dll links against the Visual C++ runtime,
+                # which is not part of Windows. Its api-ms-win-crt-*.dll imports
+                # are API sets the apiset schema redirects to ucrtbase.dll in
+                # System32, so they are not files that need deploying; these are.
+                $vcRuntime = @("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll")
+                $systemDir = Join-Path $env:WINDIR "System32"
+                # Cheap tiers first. Enumerating a Visual Studio installation
+                # recursively takes minutes, so it is only done if the runtime
+                # was not already found somewhere cheaper. These use the .NET
+                # methods rather than Test-Path because a PATH entry the agent
+                # account cannot stat makes Test-Path raise Access is denied
+                # even under -ErrorAction SilentlyContinue, which would fail the
+                # task; Directory.Exists and File.Exists just return false.
+                $cheapDirs = @($env:PATH -split ';' | Where-Object { $_ -and [IO.Directory]::Exists($_) })
+                $vsDirs = $null
+                function Get-VsRedistDirs {
+                  if ($null -ne $script:vsDirs) { return $script:vsDirs }
+                  Write-Host "  (searching Visual Studio redistributables)"
+                  $roots = @("C:\Program Files\Microsoft Visual Studio", "C:\Program Files (x86)\Microsoft Visual Studio")
+                  $script:vsDirs = @(Get-ChildItem -Path $roots -Filter "Microsoft.VC*.CRT" -Recurse -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -match '\\x64\\' } |
+                    Sort-Object @{ Expression = { $_.FullName -match '\\onecore\\' } }, FullName |
+                    ForEach-Object { $_.FullName })
+                  return $script:vsDirs
+                }
+                Write-Host "Visual C++ runtime:"
+                $unresolved = @()
+                foreach ($name in $vcRuntime) {
+                  if ([IO.File]::Exists((Join-Path $systemDir $name))) {
+                    Write-Host "  $name -> already in System32, the loader searches it"
+                    continue
+                  }
+                  $src = $null
+                  foreach ($d in $cheapDirs) {
+                    $c = Join-Path $d $name
+                    if ([IO.File]::Exists($c)) { $src = $c; break }
+                  }
+                  if (-not $src) {
+                    foreach ($d in (Get-VsRedistDirs)) {
+                      $c = Join-Path $d $name
+                      if ([IO.File]::Exists($c)) { $src = $c; break }
+                    }
+                  }
+                  if ($src) {
+                    Copy-Item -LiteralPath $src -Destination $payload -Force
+                    Write-Host "  $name -> staged from $src"
+                  } else {
+                    $unresolved += $name
+                    Write-Host "  $name -> NOT FOUND"
+                  }
+                }
+                if ($unresolved.Count -gt 0) {
+                  Write-Host "searched:"
+                  ($cheapDirs + (Get-VsRedistDirs)) | Select-Object -Unique | ForEach-Object { Write-Host "    $_" }
+                  throw ("the Visual C++ runtime required by AttestationClientLib.dll is missing: " + ($unresolved -join ", "))
+                }
+                # The remaining imports ship with Windows. Report them anyway so
+                # that if the load still fails the log names the absent one
+                # instead of costing another build to find out.
+                Write-Host "operating system dependencies:"
+                foreach ($name in @("ADVAPI32.dll", "CRYPT32.dll", "KERNEL32.dll", "Normaliz.dll", "USER32.dll",
+                                    "WLDAP32.dll", "WS2_32.dll", "ncrypt.dll", "tbs.dll", "ucrtbase.dll")) {
+                  $state = if ([IO.File]::Exists((Join-Path $systemDir $name))) { "present" } else { "ABSENT" }
+                  Write-Host "  $name -> $state"
+                }
+                Write-Host "payload:"
+                Get-ChildItem $payload | ForEach-Object { Write-Host "  $($_.Name) $($_.Length) bytes" }
+                Write-Host "##vso[task.setvariable variable=kgAttNativeDir]$payload"
           - task: PowerShell@2
             displayName: "Run Managed Identity IMDS E2E Tests"
             inputs:
@@ -252,10 +320,10 @@ stages:
                 # whose name is not predictable, so the attestation library cannot
                 # be placed in the application directory the loader searches.
                 # Compile the binary to a known directory instead and deploy the
-                # library beside it, which is how a Go service ships it.
+                # payload beside it, which is how a Go service ships it.
                 $native = "$(kgAttNativeDir)"
                 if (-not $native -or -not (Test-Path $native)) {
-                  throw "the attestation library directory was not published by the fetch step"
+                  throw "the attestation payload directory was not published by the fetch step"
                 }
                 $binDir = "$(Agent.TempDirectory)\e2ebin"
                 if (Test-Path $binDir) { Remove-Item -Recurse -Force $binDir }
@@ -265,11 +333,15 @@ stages:
                 if ($LASTEXITCODE -ne 0) { throw "failed to build the e2e test binary" }
                 Copy-Item "$native\*" $binDir -Force
                 # Presence on PATH was what the previous revision checked, and a
-                # file on PATH is unreachable to this loader. Assert it landed in a
-                # directory the loader actually searches.
-                if (-not (Test-Path "$binDir\AttestationClientLib.dll")) {
-                  throw "AttestationClientLib.dll was not deployed next to the test binary"
+                # file on PATH is unreachable to this loader. Assert every staged
+                # file landed in a directory the loader actually searches.
+                foreach ($f in Get-ChildItem $native) {
+                  if (-not [IO.File]::Exists((Join-Path $binDir $f.Name))) {
+                    throw "$($f.Name) was not deployed next to the test binary"
+                  }
                 }
+                Write-Host "deployed next to the test binary:"
+                Get-ChildItem $binDir | ForEach-Object { Write-Host "  $($_.Name)" }
                 $pkg = "github.com/AzureAD/microsoft-authentication-library-for-go/apps/tests/e2e"
                 # Quote every -test.* argument: PowerShell drops everything after
                 # the dot in an unquoted native-command argument.
