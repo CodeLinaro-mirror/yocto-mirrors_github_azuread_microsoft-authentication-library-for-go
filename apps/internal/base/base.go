@@ -136,7 +136,12 @@ type AuthResult struct {
 	// the parsed public leaf certificate. PrivateKey is the key MSAL used for the token request; it
 	// only has to implement crypto.Signer, so besides an exportable *rsa.PrivateKey it may be a
 	// non-exportable key backed by KeyGuard, CNG or an HSM, and callers must not assume the key
-	// material can be exported.
+	// material can be exported. Its concrete type is not part of the contract and will not
+	// necessarily be the key MSAL obtained from the platform: MSAL wraps it so the underlying
+	// handle stays open for as long as any copy of this certificate is reachable. Use it through
+	// crypto.Signer and do not type-assert it to a concrete type.
+	//
+	// The certificate may be copied by value; every copy shares the one key and stays valid.
 	//
 	// Present it as the client certificate when calling the resource, or the resource rejects the
 	// bound token. Two properties of Go's TLS stack make that harder than assigning it to
