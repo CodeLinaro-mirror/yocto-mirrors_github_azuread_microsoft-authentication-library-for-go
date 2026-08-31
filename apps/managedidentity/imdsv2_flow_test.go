@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -385,8 +386,12 @@ func (f *imdsFake) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ESTS answers with the type that was asked for, so the fake echoes it too.
+	// A test that wants the service to answer with something other than what
+	// was requested sets tokenType, which is how the bound-request-answered-with
+	// -a-bearer-token case is driven.
 	tokenType := f.tokenType
-	if r.Form.Get("token_type") == "" {
+	if requested := r.Form.Get("token_type"); requested == "" || strings.EqualFold(requested, "bearer") {
 		tokenType = "Bearer"
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -614,6 +619,92 @@ func withCountedAttestation(t *testing.T, tokenFor func() string) *int {
 	}
 	t.Cleanup(func() { attestKeyGuardFn = original })
 	return &calls
+}
+
+// The scope sent on leg 3 is built the way MSAL .NET builds it, so a caller
+// that writes the resource with a trailing slash, or already as a scope, gets
+// the same single "/.default" .NET would send.
+func TestScopeForResourceMatchesDotNet(t *testing.T) {
+	for _, test := range []struct{ resource, want string }{
+		{"https://vault.azure.net", "https://vault.azure.net/.default"},
+		{"https://vault.azure.net/", "https://vault.azure.net/.default"},
+		{"https://vault.azure.net//", "https://vault.azure.net/.default"},
+		{"https://vault.azure.net/.default", "https://vault.azure.net/.default"},
+	} {
+		if got := scopeForResource(test.resource); got != test.want {
+			t.Errorf("scopeForResource(%q) = %q, want %q", test.resource, got, test.want)
+		}
+	}
+}
+
+// Concurrent misses for one key collapse into a single attestation. The native
+// call and the MAA round trip behind it are expensive and MAA is rate-limited,
+// so N simultaneous callers must not become N attestations. MSAL .NET pins the
+// same behaviour with
+// MaaTokenCache_ConcurrentCacheMiss_SingleFlightCallsProviderOnce.
+func TestAttestationCollapsesConcurrentMisses(t *testing.T) {
+	clearAttestationCache()
+	t.Cleanup(clearAttestationCache)
+
+	signer, err := rsa.GenerateKey(rand.Reader, csrKeyBits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bindingKey{Signer: signer, Type: keyTypeKeyGuard}
+	token := stubAttestationJWT(t, time.Now().Add(time.Hour))
+
+	var calls int32
+	release := make(chan struct{})
+	original := attestKeyGuardFn
+	attestKeyGuardFn = func(endpoint, clientID string, k bindingKey) (string, error) {
+		// Only the first caller holds the door open. A caller that was not
+		// collapsed arrives here while it is held and is counted.
+		if atomic.AddInt32(&calls, 1) == 1 {
+			<-release
+		}
+		return token, nil
+	}
+	t.Cleanup(func() { attestKeyGuardFn = original })
+
+	const callers = 8
+	ready := make(chan struct{}, callers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	got := make([]string, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-start
+			got[i], errs[i] = attestKeyGuardCached(
+				context.Background(), "https://attestation.example", "client", key)
+		}(i)
+	}
+	for i := 0; i < callers; i++ {
+		<-ready
+	}
+	close(start)
+
+	// Every caller is now runnable and unblocked, so an implementation without
+	// the gate reaches the provider immediately. The wait only has to outlast
+	// that, not synchronise with it.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("attestations = %d, want 1: concurrent misses were not collapsed", n)
+	}
+	for i := range got {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: %v", i, errs[i])
+		}
+		if got[i] != token {
+			t.Errorf("caller %d = %q, want the attested statement", i, got[i])
+		}
+	}
 }
 
 // Two identities on the same host share one binding key, so MAA has already
@@ -901,8 +992,10 @@ func TestIMDSv2BoundAndBearerTokensDoNotShareCache(t *testing.T) {
 	if fake.callCount() == 0 {
 		t.Fatal("the bearer request was served from the bound token's cache entry")
 	}
-	if got := fake.lastTokenForm.Get("token_type"); got != "" {
-		t.Fatalf("a bearer request sent token_type=%q", got)
+	// MSAL .NET asks for the type explicitly on this path rather than letting
+	// ESTS default it, so the request carries token_type=bearer.
+	if got := fake.lastTokenForm.Get("token_type"); got != "bearer" {
+		t.Fatalf("a bearer request sent token_type=%q, want %q", got, "bearer")
 	}
 	if !fake.sawClientCert {
 		t.Fatal("WithRequestOverMtls did not use a client certificate")

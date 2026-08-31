@@ -83,6 +83,13 @@ func (m csrMetadata) validate() error {
 		return fmt.Errorf("managedidentity: IMDS returned platform metadata without a tenantId")
 	case m.CuID.isEmpty():
 		return fmt.Errorf("managedidentity: IMDS returned platform metadata without a vmId or vmssId")
+	case m.AttestationEndpoint == "":
+		// Required even when this acquisition will not attest, because MSAL .NET
+		// rejects the metadata document outright in that case
+		// (CsrMetadata.ValidateCsrMetadata). A host that omits the field is
+		// misconfigured for every caller, not only the attesting one, so both
+		// libraries should refuse it at the same point.
+		return fmt.Errorf("managedidentity: IMDS returned platform metadata with no attestationEndpoint")
 	}
 	return nil
 }

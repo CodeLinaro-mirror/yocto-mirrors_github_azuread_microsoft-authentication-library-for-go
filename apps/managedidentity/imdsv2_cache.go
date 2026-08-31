@@ -448,7 +448,7 @@ func (v imdsV2) issueBindingCertificate(ctx context.Context, correlationID strin
 			_ = key.Close()
 			return nil, err
 		}
-		attestationToken, err = attestKeyGuardCached(endpoint, metadata.ClientID, key)
+		attestationToken, err = attestKeyGuardCached(ctx, endpoint, metadata.ClientID, key)
 		if err != nil {
 			_ = key.Close()
 			return nil, err

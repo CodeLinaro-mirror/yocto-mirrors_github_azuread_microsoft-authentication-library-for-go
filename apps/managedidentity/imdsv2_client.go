@@ -185,16 +185,19 @@ func (v imdsV2) issueCredential(ctx context.Context, correlationID, csr, attesta
 		return certificateRequestResponse{}, fmt.Errorf("managedidentity: building the credential request: %w", err)
 	}
 	setIMDSHeaders(req, correlationID)
-	req.Header.Set("Content-Type", "application/json")
+	// MSAL .NET sends this body as StringContent(..., Encoding.UTF8, "application/json"),
+	// which puts the charset on the wire.
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
 	resp, err := sendIMDSRequest(ctx, v.httpClient, req, v.retryEnabled, imdsRetriableStatus)
 	if err != nil {
 		return certificateRequestResponse{}, fmt.Errorf("managedidentity: requesting a credential: %w", err)
 	}
-	if resp.StatusCode == http.StatusNotFound {
-		resp.Body.Close()
-		return certificateRequestResponse{}, ErrMtlsPoPNotSupportedInIMDSv1
-	}
+	// A 404 is deliberately not mapped to ErrMtlsPoPNotSupportedInIMDSv1 here.
+	// Only the metadata leg answers that question; reaching this leg means the
+	// host already served /getplatformmetadata, so IMDSv2 exists and a 404 is an
+	// ordinary request failure. MSAL .NET reports it generically for the same
+	// reason.
 	if err := validateIMDSServerHeader(resp); err != nil {
 		resp.Body.Close()
 		return certificateRequestResponse{}, err
@@ -436,6 +439,13 @@ func requestEntraToken(ctx context.Context, client *http.Client, binding *bindin
 	form.Set("scope", scopeForResource(resource))
 	if popRequested {
 		form.Set("token_type", authority.AccessTokenTypeMtlsPoP)
+	} else {
+		// The mTLS-bearer path asks for the type explicitly rather than letting
+		// ESTS default it, which is what MSAL .NET does. The value is lowercase
+		// because that is the request spelling .NET sends; authority's
+		// AccessTokenTypeBearer is the capitalised form that appears in the
+		// response and is not interchangeable here.
+		form.Set("token_type", "bearer")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(form.Encode()))
@@ -472,7 +482,14 @@ func requestEntraToken(ctx context.Context, client *http.Client, binding *bindin
 }
 
 // scopeForResource turns a resource into the scope the v2 endpoint expects.
+//
+// MSAL .NET builds this as resource.TrimEnd('/') + "/.default", so the trailing
+// slash has to go or a caller passing "https://vault.azure.net/" would ask for a
+// double-slashed scope. The suffix is also trimmed first, which .NET does not
+// do, so that a resource already written as a scope is not given a second
+// "/.default".
 func scopeForResource(resource string) string {
 	resource = strings.TrimSuffix(resource, "/.default")
+	resource = strings.TrimRight(resource, "/")
 	return resource + "/.default"
 }

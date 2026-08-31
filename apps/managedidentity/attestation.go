@@ -4,6 +4,7 @@
 package managedidentity
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -55,14 +56,19 @@ type attestationCacheEntry struct {
 // another. Each of those would otherwise re-attest a key that MAA has already
 // vouched for.
 //
-// The mutex guards only the map. Issuance already runs under the certificate
-// cache lock, so attestation cannot be entered concurrently in the first place,
-// which is a stronger guarantee than the per-key semaphore MSAL .NET needs. The
-// lock here keeps that from being an unstated dependency on a caller's locking.
+// The certificate cache's own gate does not serialize this. That gate is keyed
+// by identity, while the binding key is process-wide, so two identities minting
+// at once take different gates and attest the same key concurrently. gates
+// therefore holds a second set keyed by the statement rather than the identity,
+// which is what MSAL .NET's KeyedSemaphorePool in PopKeyAttestor does.
 var attestationCache = struct {
 	mu      sync.Mutex
 	entries map[string]attestationCacheEntry
-}{entries: map[string]attestationCacheEntry{}}
+	gates   map[string]*mintGate
+}{
+	entries: map[string]attestationCacheEntry{},
+	gates:   map[string]*mintGate{},
+}
 
 // attestationCacheKey identifies a cached statement by the endpoint that issued
 // it and the key it vouches for.
@@ -94,21 +100,32 @@ func attestationCacheKey(endpoint string, key bindingKey) (string, error) {
 
 // attestKeyGuardCached returns a cached statement for this key when one is still
 // fresh, and otherwise attests and caches the result.
-func attestKeyGuardCached(endpoint, clientID string, key bindingKey) (string, error) {
+//
+// Concurrent misses for the same key are collapsed into one attestation. The
+// native call and the MAA round trip behind it are expensive and MAA is
+// rate-limited, so letting every caller through would multiply both for no gain.
+func attestKeyGuardCached(ctx context.Context, endpoint, clientID string, key bindingKey) (string, error) {
 	cacheKey, keyErr := attestationCacheKey(endpoint, key)
 	// A key that cannot be fingerprinted is still attestable; it just cannot be
-	// cached, so the flow continues uncached rather than failing.
-	if keyErr == nil {
-		attestationCache.mu.Lock()
-		entry, ok := attestationCache.entries[cacheKey]
-		if ok && entry.expires.After(now().Add(attestationExpiryBuffer)) {
-			attestationCache.mu.Unlock()
-			return entry.token, nil
-		}
-		if ok {
-			delete(attestationCache.entries, cacheKey)
-		}
-		attestationCache.mu.Unlock()
+	// cached or collapsed with anything, since both are keyed by that
+	// fingerprint. The flow continues uncoordinated rather than failing.
+	if keyErr != nil {
+		return attestKeyGuardFn(endpoint, clientID, key)
+	}
+
+	if token, ok := cachedAttestation(cacheKey); ok {
+		return token, nil
+	}
+
+	if err := enterAttestation(ctx, cacheKey); err != nil {
+		return "", err
+	}
+	defer leaveAttestation(cacheKey)
+
+	// Whoever held the gate may have cached a statement while this caller
+	// waited, which is the point of having waited.
+	if token, ok := cachedAttestation(cacheKey); ok {
+		return token, nil
 	}
 
 	token, err := attestKeyGuardFn(endpoint, clientID, key)
@@ -119,12 +136,71 @@ func attestKeyGuardCached(endpoint, clientID string, key bindingKey) (string, er
 	// A statement whose lifetime cannot be read is used but not stored: caching
 	// it would mean guessing when to stop trusting it. MSAL .NET arrives at the
 	// same behaviour by treating a missing expiry as already expired.
-	if expires, ok := attestationTokenExpiry(token); ok && keyErr == nil {
+	if expires, ok := attestationTokenExpiry(token); ok {
 		attestationCache.mu.Lock()
 		attestationCache.entries[cacheKey] = attestationCacheEntry{token: token, expires: expires}
 		attestationCache.mu.Unlock()
 	}
 	return token, nil
+}
+
+// cachedAttestation returns a statement that is still comfortably in date,
+// dropping one that is not so a later caller does not re-examine it.
+func cachedAttestation(cacheKey string) (string, bool) {
+	attestationCache.mu.Lock()
+	defer attestationCache.mu.Unlock()
+	entry, ok := attestationCache.entries[cacheKey]
+	if !ok {
+		return "", false
+	}
+	if entry.expires.After(now().Add(attestationExpiryBuffer)) {
+		return entry.token, true
+	}
+	delete(attestationCache.entries, cacheKey)
+	return "", false
+}
+
+// enterAttestation blocks until this caller is the only one attesting cacheKey.
+func enterAttestation(ctx context.Context, cacheKey string) error {
+	attestationCache.mu.Lock()
+	gate, ok := attestationCache.gates[cacheKey]
+	if !ok {
+		gate = &mintGate{ch: make(chan struct{}, 1)}
+		attestationCache.gates[cacheKey] = gate
+	}
+	gate.waiters++
+	attestationCache.mu.Unlock()
+
+	select {
+	case gate.ch <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		releaseAttestationWaiter(cacheKey)
+		return ctx.Err()
+	}
+}
+
+// leaveAttestation releases the gate taken by enterAttestation.
+func leaveAttestation(cacheKey string) {
+	attestationCache.mu.Lock()
+	gate, ok := attestationCache.gates[cacheKey]
+	attestationCache.mu.Unlock()
+	if !ok {
+		return
+	}
+	<-gate.ch
+	releaseAttestationWaiter(cacheKey)
+}
+
+func releaseAttestationWaiter(cacheKey string) {
+	attestationCache.mu.Lock()
+	defer attestationCache.mu.Unlock()
+	if gate, ok := attestationCache.gates[cacheKey]; ok {
+		gate.waiters--
+		if gate.waiters <= 0 {
+			delete(attestationCache.gates, cacheKey)
+		}
+	}
 }
 
 // attestationTokenExpiry reads the exp claim of a JWT. It reports whether one
