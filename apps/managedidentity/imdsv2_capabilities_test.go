@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/oauth/ops/authority"
 )
@@ -459,6 +460,86 @@ func TestCapabilitiesRetriesATransientProbeFailure(t *testing.T) {
 	}
 	if got := strings.Join(fake.calls, ","); got != "metadata,metadata,metadata,metadata" {
 		t.Fatalf("calls = %q, want a 500 retried three times", got)
+	}
+}
+
+// A transient failure is not the host's answer, so it must not become the
+// answer for the rest of the process. One IMDS blip while a service starts up
+// would otherwise leave a fully KeyGuard-capable host reporting None, failing
+// every WithMtlsPoPMinStrength acquisition until the process restarted.
+func TestCapabilitiesReprobesAfterATransientFailure(t *testing.T) {
+	withCleanCaches(t)
+	realNow := now
+	current := realNow()
+	now = func() time.Time { return current }
+	t.Cleanup(func() { now = realNow })
+
+	fake := newIMDSFake(t)
+	fake.metadataStatus = http.StatusInternalServerError
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	got, err := client.Capabilities(context.Background())
+	if err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	if got.MaxSupportedBindingStrength != MtlsBindingStrengthNone {
+		t.Fatalf("strength = %s, want None while IMDS is failing", got.MaxSupportedBindingStrength)
+	}
+
+	// IMDS recovers, but the failed answer is still inside its reuse window, so
+	// the host is deliberately not asked again yet.
+	fake.metadataStatus = http.StatusOK
+	fake.calls = nil
+	if _, err = client.Capabilities(context.Background()); err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("calls = %q, want the failure reused inside the retry interval", fake.calls)
+	}
+
+	// Past the window it is asked again, and now gets a real answer.
+	current = current.Add(capabilitiesRetryInterval + time.Second)
+	if got, err = client.Capabilities(context.Background()); err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	if len(fake.calls) == 0 {
+		t.Fatal("want a re-probe once the retry interval elapsed, got none")
+	}
+	if got.MaxSupportedBindingStrength != MtlsBindingStrengthKeyGuard {
+		t.Fatalf("strength = %s, want KeyGuard once IMDS recovered", got.MaxSupportedBindingStrength)
+	}
+}
+
+// The complement of the test above. A 404 is the host stating that it serves
+// IMDSv1 only, which cannot change under a running process, so it must still be
+// cached for good: without this, re-probing transient failures would degrade
+// into probing every v1-only host on every call.
+func TestCapabilitiesCachesAV1OnlyHostForTheProcessLifetime(t *testing.T) {
+	withCleanCaches(t)
+	realNow := now
+	current := realNow()
+	now = func() time.Time { return current }
+	t.Cleanup(func() { now = realNow })
+
+	fake := newIMDSFake(t)
+	fake.metadataStatus = http.StatusNotFound
+	client := fake.newTestClient(t, SystemAssigned(), newFakeKeyProvider())
+
+	if _, err := client.Capabilities(context.Background()); err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+
+	fake.calls = nil
+	current = current.Add(100 * capabilitiesRetryInterval)
+	got, err := client.Capabilities(context.Background())
+	if err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("calls = %q, want a v1-only host answered from cache forever", fake.calls)
+	}
+	if got.MaxSupportedBindingStrength != MtlsBindingStrengthNone {
+		t.Fatalf("strength = %s, want None on a v1-only host", got.MaxSupportedBindingStrength)
 	}
 }
 

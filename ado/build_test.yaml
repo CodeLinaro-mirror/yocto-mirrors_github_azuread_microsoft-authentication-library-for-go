@@ -182,8 +182,6 @@ stages:
               version: $(goVersion)
           - task: PowerShell@2
             displayName: "Fetch the KeyGuard attestation library"
-            env:
-              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
             inputs:
               targetType: "inline"
               script: |
@@ -201,7 +199,11 @@ stages:
                 New-Item -ItemType Directory -Force -Path $dir | Out-Null
                 $nupkg = "$dir\$pkg.$ver.nupkg"
                 $url = "https://pkgs.dev.azure.com/IdentityDivision/_packaging/IDDP_PublicPackages/nuget/v3/flat2/$pkg/$ver/$pkg.$ver.nupkg"
-                Invoke-WebRequest -Headers @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" } -Uri $url -OutFile $nupkg
+                # No Authorization header: IDDP_PublicPackages serves this feed
+                # anonymously over HTTPS, and the package and version above are
+                # pinned. Sending a credential the feed does not ask for would
+                # only risk turning a working anonymous read into a 401.
+                Invoke-WebRequest -Uri $url -OutFile $nupkg
                 Write-Host "downloaded $((Get-Item $nupkg).Length) bytes"
                 # A .nupkg is a zip, but Expand-Archive rejects the extension, so
                 # unpack it through the API that goes by content instead of name.
@@ -293,6 +295,34 @@ stages:
                 Write-Host "payload:"
                 Get-ChildItem $payload | ForEach-Object { Write-Host "  $($_.Name) $($_.Length) bytes" }
                 Write-Host "##vso[task.setvariable variable=kgAttNativeDir]$payload"
+          - task: PowerShell@2
+            displayName: "Run KeyGuard and certificate store hardware tests"
+            inputs:
+              targetType: "inline"
+              workingDirectory: "$(System.DefaultWorkingDirectory)"
+              script: |
+                $ErrorActionPreference = "Stop"
+                # These drive the real VBS-isolated key through NCrypt and the real
+                # CurrentUser\My store through crypt32. They are the only automated
+                # coverage for that interop, and they are opt-in because they need
+                # KeyGuard hardware and mutate machine state, so this pool is the
+                # only place they can run at all. Left unset they skip, and a skipped
+                # test stage is indistinguishable from a passing one.
+                $env:MSAL_TEST_REAL_KEYGUARD = "1"
+                $env:MSAL_TEST_REAL_CERT_STORE = "1"
+                # The store tests scope every entry to an alias generated for the run
+                # and remove it in cleanup. The KeyGuard tests deliberately keep the
+                # key: the container is shared with MSAL .NET, and deleting it would
+                # invalidate every certificate either library has already persisted.
+                $output = & go test ./apps/managedidentity/ -run "RealKeyGuard|RealStore" -count=1 -v 2>&1
+                $exit = $LASTEXITCODE
+                $output | ForEach-Object { Write-Host $_ }
+                if ($exit -ne 0) { throw "KeyGuard/certificate store hardware tests failed" }
+                # Guard the opt-in itself. If either variable stopped being honoured
+                # the tests would skip, the step would exit 0, and the stage would go
+                # green having exercised none of this.
+                if ($output -match '^--- SKIP') { throw "hardware tests skipped even though the opt-in is set" }
+                if (-not ($output -match '^--- PASS')) { throw "no hardware tests ran" }
           - task: PowerShell@2
             displayName: "Run Managed Identity IMDS E2E Tests"
             inputs:

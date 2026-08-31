@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // MtlsBindingStrength describes how strongly a token can be bound to a
@@ -122,15 +123,33 @@ func (c Capabilities) IsMtlsPoPSupportedByHost() bool {
 // what would otherwise happen in a service that resolves credentials on many
 // goroutines at once. MSAL .NET does the same with a static field and a
 // semaphore.
+//
+// expires separates the two kinds of negative answer. A definitive one - "this
+// host serves IMDSv1 only", "this platform has no key provider" - is a fact
+// about the host that cannot change while the process runs, so it is stored
+// with a zero expires and never revisited. A transient failure is not an answer
+// at all, so it is only reused until expires.
 var capabilitiesCache struct {
-	mu     sync.Mutex
-	result *Capabilities
+	mu      sync.Mutex
+	result  *Capabilities
+	expires time.Time
 }
+
+// capabilitiesRetryInterval is how long a transient discovery failure is reused
+// before the host is probed again.
+//
+// It bounds two opposite costs. Caching such a failure for the life of the
+// process leaves a fully capable host reporting MtlsBindingStrengthNone until
+// it restarts, because nothing else invalidates the entry. Never caching it
+// makes every caller pay a full probe, retries included, against a service that
+// is already failing, which is the worst moment to add load to it.
+const capabilitiesRetryInterval = 30 * time.Second
 
 func clearCapabilitiesCache() {
 	capabilitiesCache.mu.Lock()
 	defer capabilitiesCache.mu.Unlock()
 	capabilitiesCache.result = nil
+	capabilitiesCache.expires = time.Time{}
 }
 
 // Capabilities reports what this host can do for managed identity.
@@ -144,17 +163,23 @@ func clearCapabilitiesCache() {
 // with an empty Source and a populated ErrorReason, because "there is no
 // managed identity here" is an answer a credential chain acts on rather than a
 // failure.
+//
+// A transient failure to reach the metadata service is reported the same way,
+// but is not taken as the host's settled answer: it is reused for at most
+// capabilitiesRetryInterval and then re-probed, so a host that was briefly
+// unreachable is not written off for the life of the process.
 func (c Client) Capabilities(ctx context.Context) (Capabilities, error) {
 	capabilitiesCache.mu.Lock()
 	defer capabilitiesCache.mu.Unlock()
-	if capabilitiesCache.result != nil {
+	if capabilitiesCache.result != nil &&
+		(capabilitiesCache.expires.IsZero() || now().Before(capabilitiesCache.expires)) {
 		return *capabilitiesCache.result, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return Capabilities{}, err
 	}
 
-	result := c.discoverCapabilities(ctx)
+	result, definitive := c.discoverCapabilities(ctx)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		// A result reached under a cancelled context may be the cancellation
 		// rather than the host's answer, and caching it would make one
@@ -162,15 +187,24 @@ func (c Client) Capabilities(ctx context.Context) (Capabilities, error) {
 		return Capabilities{}, ctxErr
 	}
 	capabilitiesCache.result = &result
+	if definitive {
+		capabilitiesCache.expires = time.Time{}
+	} else {
+		capabilitiesCache.expires = now().Add(capabilitiesRetryInterval)
+	}
 	return result, nil
 }
 
-func (c Client) discoverCapabilities(ctx context.Context) Capabilities {
+// discoverCapabilities works out what this host supports. The second return
+// reports whether the answer is definitive: a fact about the host rather than a
+// failure that may not repeat. Only a definitive answer is cached for the life
+// of the process.
+func (c Client) discoverCapabilities(ctx context.Context) (Capabilities, bool) {
 	// An environment-configured source is authoritative and costs nothing to
 	// read, so it settles the question without a probe. None of these sources
 	// issues a binding certificate, so none of them can bind a token.
 	if c.source != DefaultToIMDS {
-		return Capabilities{Source: c.source, MaxSupportedBindingStrength: MtlsBindingStrengthNone}
+		return Capabilities{Source: c.source, MaxSupportedBindingStrength: MtlsBindingStrengthNone}, true
 	}
 
 	// IMDSv2 is probed before falling back to v1. The v2 endpoint only exists
@@ -185,7 +219,7 @@ func (c Client) discoverCapabilities(ctx context.Context) Capabilities {
 			Source:                      DefaultToIMDS,
 			MaxSupportedBindingStrength: MtlsBindingStrengthNone,
 			ErrorReason:                 ErrMtlsNotSupportedForPlatform.Error(),
-		}
+		}, true
 	}
 
 	v := imdsV2{
@@ -197,17 +231,23 @@ func (c Client) discoverCapabilities(ctx context.Context) Capabilities {
 		probe:        true,
 	}
 	if _, err := v.getCsrMetadata(ctx, newCorrelationID()); err != nil {
+		// A 404 is the host answering that it serves IMDSv1 only, which is
+		// settled and cannot change under a running process. Anything else - a
+		// 5xx, a throttle, a timeout - is a failure to obtain an answer rather
+		// than an answer, and the retries above have already given it every
+		// chance to succeed, so it is reported but not treated as final.
+		definitive := errors.Is(err, ErrMtlsPoPNotSupportedInIMDSv1)
 		return Capabilities{
 			Source:                      DefaultToIMDS,
 			MaxSupportedBindingStrength: MtlsBindingStrengthNone,
 			ErrorReason:                 err.Error(),
-		}
+		}, definitive
 	}
 
 	return Capabilities{
 		Source:                      DefaultToIMDS,
 		MaxSupportedBindingStrength: bindingStrengthFor(v.keyProvider),
-	}
+	}, true
 }
 
 // bindingStrengthFor reports the strongest binding a host that already answered
