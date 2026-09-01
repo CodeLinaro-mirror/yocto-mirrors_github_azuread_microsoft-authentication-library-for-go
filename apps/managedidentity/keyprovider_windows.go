@@ -310,6 +310,8 @@ func keyCanSign(key windows.Handle) bool {
 		return false
 	}
 	digest := make([]byte, crypto.SHA256.Size())
+	// #nosec G115 -- crypto.SHA256.Size() is the constant 32, so the conversion
+	// cannot overflow uint32.
 	padInfo := bcryptPSSPaddingInfo{pszAlgID: algID, cbSalt: uint32(crypto.SHA256.Size())}
 	defer runtime.KeepAlive(algID)
 	defer runtime.KeepAlive(&padInfo)

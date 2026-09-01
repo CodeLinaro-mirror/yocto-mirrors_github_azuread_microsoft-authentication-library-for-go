@@ -18,8 +18,12 @@ import (
 	"encoding/hex"
 	"math/big"
 	"os"
+	"syscall"
 	"testing"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // These tests use the real KeyGuard key in the shared CNG container. They need
@@ -253,4 +257,84 @@ func TestRealKeyGuardContainerIsStable(t *testing.T) {
 			t.Fatalf("write %s: %v", path, err)
 		}
 	}
+}
+
+// TestRealKeyGuardKeyIsNotExportable proves the property the whole design rests
+// on: the private half of the binding key cannot be taken off this machine.
+//
+// It is the direct counterpart to TestRealKeyGuardKeySigns. Together they answer
+// the question IMDSv2 exists to answer -- this key signs, but it cannot be
+// copied -- against a real VBS trustlet rather than a mock. A software key would
+// pass the signing test alone.
+//
+// The authoritative check is behavioral: every blob type CNG defines that would
+// carry private material is actually requested, and every one must fail. The
+// export policy value is reported alongside it but is not the proof, because the
+// CNG container is shared with MSAL .NET and a key either library created is
+// isolated by VBS regardless of what that property says.
+//
+// The public blob is exported last and must succeed. Without it the refusals
+// above would also be satisfied by a closed or broken handle.
+func TestRealKeyGuardKeyIsNotExportable(t *testing.T) {
+	provider := requireRealKeyGuard(t)
+
+	key, err := provider.getOrCreateKey(bindingKeyName)
+	if err != nil {
+		t.Fatalf("getOrCreateKey: %v", err)
+	}
+	defer func() { _ = key.Close() }()
+
+	if key.Type != keyTypeKeyGuard {
+		t.Fatalf("key type = %s, want KeyGuard; this host reported VBS but produced a weaker key", key.Type)
+	}
+	signer, ok := key.Signer.(*ncryptSigner)
+	if !ok {
+		t.Fatalf("signer is %T, want *ncryptSigner", key.Signer)
+	}
+
+	if policy, found, err := getDWORDProperty(signer.key, ncryptExportPolicyProperty); err != nil {
+		t.Logf("reading %q: %v", ncryptExportPolicyProperty, err)
+	} else if !found {
+		t.Logf("the KSP reports no %q for this key", ncryptExportPolicyProperty)
+	} else if policy != 0 {
+		t.Logf("%q = %#x, not 0; the refusals below are what matter", ncryptExportPolicyProperty, policy)
+	}
+
+	// BCRYPT_RSAPRIVATE_BLOB carries the primes, BCRYPT_RSAFULLPRIVATE_BLOB the
+	// full private key, and PKCS8_PRIVATEKEY the standard encrypted-capable
+	// encoding. Asking for the size alone is enough: NCryptExportKey enforces
+	// isolation on that call, before any buffer is allocated.
+	for _, blobType := range []string{"RSAPRIVATEBLOB", "RSAFULLPRIVATEBLOB", "PKCS8_PRIVATEKEY"} {
+		blobType := blobType
+		t.Run(blobType, func(t *testing.T) {
+			if err := tryExportPrivateBlob(signer.key, blobType); err == nil {
+				t.Fatalf("CNG produced a %s for a KeyGuard key: the private key left the trustlet", blobType)
+			} else {
+				t.Logf("%s refused, as required: %v", blobType, err)
+			}
+		})
+	}
+
+	if _, err := exportRSAPublic(signer.key); err != nil {
+		t.Fatalf("the public key must still export, or the refusals above prove nothing: %v", err)
+	}
+}
+
+// tryExportPrivateBlob asks CNG for a named private-key blob and reports
+// whether it produced one. Only the size is requested, which is where the
+// provider enforces the export policy.
+func tryExportPrivateBlob(key windows.Handle, blobType string) error {
+	name, err := windows.UTF16PtrFromString(blobType)
+	if err != nil {
+		return err
+	}
+	var size uint32
+	status, _, _ := syscall.SyscallN(procNCryptExportKey.Addr(),
+		uintptr(key), 0, uintptr(unsafe.Pointer(name)), 0, 0, 0,
+		uintptr(unsafe.Pointer(&size)), uintptr(ncryptSilentFlag),
+	)
+	if status != 0 {
+		return ncryptStatusError("NCryptExportKey("+blobType+")", status)
+	}
+	return nil
 }
