@@ -494,7 +494,8 @@ file automatically through NuGet's native-asset convention, which Go has no equi
 Without the option nothing is attested and the credential request goes out non-attested, matching
 MSAL .NET when its optional `Microsoft.Identity.Client.KeyAttestation` package is not referenced.
 With it, a failure to attest is an **error, not a downgrade** — a caller that asked for attestation
-is never silently given a credential that lacks it.
+is never silently given a credential that lacks it. MSAL .NET does the same, raising
+`attestation_failed` rather than falling back.
 
 Attested and non-attested certificates are cached separately, so opting in never reuses a
 certificate that was issued without attestation.
